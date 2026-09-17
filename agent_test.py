@@ -482,6 +482,22 @@ class ModelPoolResilienceTest(unittest.TestCase):
         self.assertEqual(client.max_retries, 0)
         self.assertEqual(client.timeout, 42.0)
 
+    def test_an_endpoint_without_a_key_gets_a_placeholder(self):
+        environ = dict(os.environ)
+        environ.pop("OPENAI_API_KEY", None)
+        with unittest.mock.patch.dict(os.environ, environ, clear=True):
+            pool = A.ModelPool()
+            client = pool.client(A.ModelSpec("leader", "m", "http://url", ""))
+            self.assertEqual(client.api_key, "no-key")
+
+    def test_a_keyless_endpoint_keeps_the_environment_fallback(self):
+        environ = dict(os.environ)
+        environ["OPENAI_API_KEY"] = "from-env"
+        with unittest.mock.patch.dict(os.environ, environ, clear=True):
+            pool = A.ModelPool()
+            client = pool.client(A.ModelSpec("leader", "m", "http://url", ""))
+            self.assertEqual(client.api_key, "from-env")
+
     def test_an_unbounded_policy_leaves_the_transport_alone(self):
         pool = A.ModelPool(A.RetryPolicy(timeout=0))
         client = pool.client(A.ModelSpec("leader", "m", "http://url", "k"))

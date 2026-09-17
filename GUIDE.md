@@ -141,7 +141,7 @@ repl banner reports. `--config path` is the same switch from the command line.
 # agent.yaml
 name: scribe
 model: some/leader-model
-api_key: ${oc.env:AGENT_API_KEY}
+api_key: ${oc.env:AGENT_API_KEY}   # omit it entirely for keyless endpoints
 vision:
   model: some/vision-model
   max_tokens: 2048
@@ -404,6 +404,10 @@ instructions plus a text/image message pair and returns the text answer. Both
 take a `policy=`, a `usage=` sink and an `on_retry=` callback, and both fall
 back to the policy of the pool; what they spend lands on `ModelPool.usage`, on
 the sink and on the run in progress.
+
+The key is optional: an empty `api_key` leaves the SDK's own environment lookup
+in place, and when that would find nothing the pool passes a placeholder so
+keyless endpoints (a local Ollama, a proxy) construct a client at all.
 
 `Agent.build_model(config, role)` pulls from the pool, disables SDK tracing and
 sets the leader's client as the SDK default. `Agent.build_vision(config)` returns

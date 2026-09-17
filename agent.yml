@@ -1,5 +1,9 @@
 # agent.yml — default configuration for the `Agent` harness.
 
-api_url: http://127.0.0.1:11434/v1
+# Local Ollama host
+#api_url: http://127.0.0.1:11434/v1 
+# Network Ollama host
+api_url: http://192.168.1.42:11434/v1 
 
+# Default Ollama model
 model: huihui_ai/Qwen3.8-abliterated:27b

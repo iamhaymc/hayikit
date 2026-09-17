@@ -99,7 +99,7 @@ uv pip install --python .venv/bin/python -e .
 ## Run
 
 ```
-export AGENT_API_KEY=...                # never commit it
+export AGENT_API_KEY=...                # only for endpoints that need auth
 python agent.py                         # chat in the terminal
 python agent.py --input notes.md        # one shot run, streamed to the console
 python agent.py --serve                 # REST API + websocket hub + chat UI
@@ -128,7 +128,7 @@ a fallback. Point at another one with `--config path` or
 ```yaml
 name: scribe
 model: some/leader-model
-api_key: ${oc.env:AGENT_API_KEY}   # keep the secret in the environment
+api_key: ${oc.env:AGENT_API_KEY}   # omit it entirely for keyless endpoints
 vision:                            # a group flattens onto vision_*
   model: some/vision-model
 repo:

@@ -1995,9 +1995,15 @@ class ModelPool:
             if self.policy.timeout:
                 options["timeout"] = self.policy.timeout
             # An empty key means "no key here": pass nothing so the SDK falls
-            # back to its own environment lookups (OPENAI_API_KEY, ...).
+            # back to its own environment lookups (OPENAI_API_KEY, ...). When
+            # that lookup would find nothing either, hand the SDK a placeholder
+            # instead — it refuses to construct a client without some key, and
+            # endpoints that need no auth (a local Ollama, a proxy) would fail
+            # to start over a credential they never ask for.
             if spec.api_key:
                 options["api_key"] = spec.api_key
+            elif not os.environ.get("OPENAI_API_KEY"):
+                options["api_key"] = "no-key"
             client = AsyncOpenAI(base_url=spec.api_url, **options)
             self._clients[spec.endpoint] = client
         return client

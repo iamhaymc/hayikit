@@ -95,6 +95,8 @@ read, everything else is used as is. That is the whole reason the CLI needs only
 Secrets are recognized by field name (`*_api_key`, `*_token`, `*secret*`, …) and
 masked by `to_dict()` and by the console banner, so a config can be logged,
 served over the REST API or printed without redacting it by hand at each site.
+An empty `api_key` is a valid state, not a missing one: endpoints that need no
+auth are configured by leaving the key unset.
 
 ### Config files
 
@@ -304,6 +306,12 @@ so an additional role costs no additional connection. Specialist endpoints and
 credentials fall back to the leader's, which makes a second model on the same
 provider a single setting. Adding a role is therefore three steps: add the
 fields, resolve with `config.model_spec(role)`, call the pool.
+
+The API key is optional. Endpoints that need no auth — a local Ollama, a
+forwarding proxy — are configured with an empty key, and the pool hands the SDK
+a placeholder rather than letting it refuse to construct a client over a
+credential it would never send. A set `OPENAI_API_KEY` still wins, so the SDK's
+own environment fallback keeps working.
 
 ## Tools
 
@@ -541,3 +549,9 @@ harness.
 - **Tokens reaching disk.** An authenticated clone URL persists in `.git/config`
   by default; the remote is rewritten to the clean URL right after cloning and
   all git output is masked.
+- **A missing key refused to start keyless endpoints.** The pool passed no key
+  when none was configured and relied on the SDK's `OPENAI_API_KEY` fallback —
+  but when that lookup also found nothing, the SDK refused to construct a client
+  and a local Ollama could not be reached over a credential it never asks for.
+  An empty key now falls back to a placeholder, with a set `OPENAI_API_KEY`
+  still winning.
