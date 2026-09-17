@@ -16,8 +16,9 @@ each be replaced by a consumer:
 | models    | `ModelSpec`, `ModelPool`                         |
 | tools     | `Workspace`, `ToolRegistry`                      |
 | console   | `ConsoleRenderer`                                |
-| core      | `Engine`, `Agent`, `RunResult`                   |
 | commands  | `CommandRegistry`                                |
+| core      | `Engine`, `Agent`, `RunResult`                   |
+| repl      | `Repl`                                           |
 | web       | `Hub`, `WebServer`                               |
 | cli       | `main`                                           |
 
@@ -32,8 +33,17 @@ the loop on its own instead, with none of the batteries above::
     engine = agent.Engine(api_key=..., model=..., env=False)
     result = await engine.run(my_messages, tools=my_tools)
 
-The module also works as a data driven application (``python agent.py --input
-notes.md [--serve]``); see `main`.
+The module also works as a data driven application. With no arguments it opens
+an interactive terminal; ``--input`` performs one run and ``--serve`` starts the
+web layer::
+
+    python agent.py                     # chat in the terminal
+    python agent.py --input notes.md    # one run, streamed to the console
+    python agent.py --serve             # REST API, websocket hub and chat UI
+
+Configuration is read from ``agent.json``, ``agent.yaml`` or ``agent.yml`` — the
+current directory first, then next to this file — before the ``AGENT_*``
+environment; see `find_config_file` and `main`.
 """
 
 from __future__ import annotations
@@ -48,12 +58,15 @@ import inspect
 import json
 import mimetypes
 import os
+import queue
 import random
 import re
 import shutil
+import signal
 import sqlite3
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field, fields, replace
@@ -91,6 +104,7 @@ __all__ = [
     "RepoError",
     "RepoManager",
     "RepoSpec",
+    "Repl",
     "RetryPolicy",
     "RunResult",
     "Session",
@@ -104,18 +118,22 @@ __all__ = [
     "Usage",
     "WebServer",
     "Workspace",
+    "find_config_file",
     "main",
+    "read_config_file",
 ]
 
 ROOT = Path(__file__).resolve().parent
+STEM = Path(__file__).stem
 
 Handler = Callable[["Event"], Any]
 
 # ---------------------------------------------------------------------------
 # Config
 #
-# Values are resolved in layers: dataclass defaults, then the environment
-# (``AGENT_*``), then whatever the consumer or the CLI passes in.
+# Values are resolved in layers: dataclass defaults, then a JSON or YAML config
+# file, then the environment (``AGENT_*``), then whatever the consumer or the
+# CLI passes in.
 # ---------------------------------------------------------------------------
 
 ENV_PREFIX = "AGENT_"
@@ -178,6 +196,138 @@ def _coerce(value: str, kind: Any) -> Any:
     if kind is Path:
         return Path(value).expanduser()
     return value
+
+
+def _coerce_value(value: Any, kind: Any) -> Any:
+    """Coerce a value parsed out of a config file into a config field type."""
+    if isinstance(value, str):
+        return _coerce(value, kind)
+    if kind is Path and isinstance(value, Path):
+        return value.expanduser()
+    if kind is bool and isinstance(value, (int, float)):
+        return bool(value)
+    if kind is int and isinstance(value, float) and value.is_integer():
+        return int(value)
+    if kind is float and isinstance(value, int) and not isinstance(value, bool):
+        return float(value)
+    return value
+
+
+# Config files. A file named after this module (``agent.json``, ``agent.yaml``
+# or ``agent.yml``) is the layer between the dataclass defaults and the
+# environment. The current directory wins over the directory this module lives
+# in, so a consumer overrides the defaults shipped beside the harness.
+
+CONFIG_SUFFIXES = (".json", ".yaml", ".yml")
+
+
+def config_directories(directories: Iterable[Path | str] | None = None) -> list[Path]:
+    """The directories a config file is looked for in, nearest first."""
+    raw = [Path.cwd(), ROOT] if directories is None else [Path(d) for d in directories]
+    seen: set[str] = set()
+    out: list[Path] = []
+    for directory in raw:
+        resolved = Path(directory).expanduser()
+        key = str(resolved)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(resolved)
+    return out
+
+
+def config_candidates(
+    stem: str = "", directories: Iterable[Path | str] | None = None
+) -> list[Path]:
+    """Every config file path that is looked at, in order of precedence."""
+    stem = stem or STEM
+    return [
+        directory / f"{stem}{suffix}"
+        for directory in config_directories(directories)
+        for suffix in CONFIG_SUFFIXES
+    ]
+
+
+def find_config_file(
+    stem: str = "", directories: Iterable[Path | str] | None = None
+) -> Path | None:
+    """The first config file that exists, or ``None`` when there is none."""
+    for path in config_candidates(stem, directories):
+        if path.is_file():
+            return path
+    return None
+
+
+def read_config_file(path: Path | str) -> dict[str, Any]:
+    """Read a JSON or YAML config file into a mapping.
+
+    Parsed with `omegaconf` when it is installed, which also resolves
+    interpolations such as ``api_key: ${oc.env:AGENT_API_KEY}`` and
+    ``model: ${defaults.model}``. Without it JSON still works and YAML falls
+    back to `pyyaml`.
+    """
+    file = Path(path).expanduser()
+    text = file.read_text(encoding="utf-8")
+    data = json.loads(text) if file.suffix.lower() == ".json" else _parse_yaml(text)
+    data = _resolve_interpolations(data)
+    if data is None:
+        return {}
+    if not isinstance(data, dict):
+        raise ValueError(f"{file} must contain a mapping of settings")
+    return data
+
+
+def _parse_yaml(text: str) -> Any:
+    """Parse YAML with whichever of omegaconf or pyyaml is installed."""
+    with contextlib.suppress(ImportError):
+        from omegaconf import OmegaConf
+
+        return OmegaConf.create(text)
+    try:
+        import yaml
+    except ImportError as exc:  # pragma: no cover - depends on the install
+        raise RuntimeError(
+            "reading a YAML config file needs the 'omegaconf' (or 'pyyaml') package"
+        ) from exc
+    return yaml.safe_load(text)
+
+
+def _resolve_interpolations(data: Any) -> Any:
+    """Resolve ``${...}`` references and return plain Python containers."""
+    with contextlib.suppress(ImportError):
+        from omegaconf import OmegaConf
+
+        if not OmegaConf.is_config(data):
+            if not isinstance(data, (dict, list)):
+                return data
+            data = OmegaConf.create(data)
+        return OmegaConf.to_container(data, resolve=True)
+    return data
+
+
+def flatten_config(data: dict[str, Any], known: Iterable[str]) -> dict[str, Any]:
+    """Flatten the nested groups a config file may use onto field names.
+
+    ``vision: {model: v}`` becomes ``vision_model``, but only when every key of
+    the group names a real field; anything else is left alone and ends up in
+    `AgentConfig.extras`. A nested ``extras`` mapping is folded in as is.
+    """
+    fields_ = set(known)
+    out: dict[str, Any] = {}
+    for key, value in data.items():
+        if key == "extras":
+            if isinstance(value, dict):
+                out.update(value)
+            continue
+        if (
+            isinstance(value, dict)
+            and value
+            and all(f"{key}_{sub}" in fields_ for sub in value)
+        ):
+            out.update({f"{key}_{sub}": item for sub, item in value.items()})
+            continue
+        out[key] = value
+    return out
 
 
 @dataclass(frozen=True)
@@ -254,6 +404,9 @@ class AgentConfig:
     # text it resolves to. Templates read `config.input`.
     input_source: str = ""
     input: str = ""
+    # Prompt template used by the data driven application: a file path or the
+    # template itself. Left empty, `load_template` looks for `agent_prompt.md`.
+    template: str = ""
     # Workspaces / sessions
     workspace_root: Path | None = None
     # Directory copied into every new session workspace (application content).
@@ -330,6 +483,37 @@ class AgentConfig:
             with contextlib.suppress(ValueError):
                 overrides[f.name] = _coerce(raw, _field_kind(str(f.type)))
         return self.merge(**overrides)
+
+    def with_data(self, data: dict[str, Any]) -> "AgentConfig":
+        """Return a copy with a parsed mapping applied, coerced to field types.
+
+        Values arrive from a config file, so they are already typed; strings are
+        coerced the way the environment layer coerces them, unknown keys go to
+        `extras` and a ``null`` leaves the default in place.
+        """
+        known = {f.name: f for f in fields(self)}
+        overrides: dict[str, Any] = {}
+        for key, value in flatten_config(data, known).items():
+            declared = known.get(key)
+            if declared is None:
+                overrides[key] = value
+                continue
+            with contextlib.suppress(ValueError, TypeError):
+                overrides[key] = _coerce_value(value, _field_kind(str(declared.type)))
+        return self.merge(**overrides)
+
+    def with_file(self, path: Path | str | None = None) -> "AgentConfig":
+        """Return a copy with the values of a JSON or YAML config file applied.
+
+        Without a path the file is the one `find_config_file` locates:
+        ``agent.json``, ``agent.yaml`` or ``agent.yml``, taken from the current
+        directory first and from the directory of ``agent.py`` as a fallback.
+        Missing files are not an error when nothing was asked for by name.
+        """
+        file = Path(path).expanduser() if path else find_config_file()
+        if file is None:
+            return self
+        return self.with_data(read_config_file(file))
 
     def model_spec(self, role: str = LEADER_ROLE) -> ModelSpec | None:
         """Resolve `role` to a `ModelSpec`, or ``None`` when it is not configured.
@@ -2302,13 +2486,22 @@ class ConsoleRenderer:
     }
     RESET = "\x1b[0m"
 
-    def __init__(self, *, color: bool | None = None, stream: Any = None) -> None:
+    def __init__(
+        self,
+        *,
+        color: bool | None = None,
+        stream: Any = None,
+        banners: bool = True,
+    ) -> None:
         self.stream = stream or sys.stdout
         if color is None:
             color = bool(getattr(self.stream, "isatty", lambda: False)()) and (
                 os.environ.get("NO_COLOR") is None
             )
         self.color = color
+        #: Print the config banner when a run starts. A repl prints its own once
+        #: and turns this off, so a banner is not repeated on every prompt.
+        self.banners = banners
         self._prev_kind: str | None = None
         self._trailing_newlines = 0
 
@@ -2331,7 +2524,7 @@ class ConsoleRenderer:
         kind = event.data.get("kind", "output")
         if event.type == EventType.AGENT_START:
             config = event.data.get("config")
-            if isinstance(config, AgentConfig):
+            if self.banners and isinstance(config, AgentConfig):
                 self.banner(config.name, config.banner_items())
         elif event.type == EventType.BLOCK_DELTA:
             self.emit(kind, event.data.get("text", ""))
@@ -2689,9 +2882,14 @@ class Engine:
         workspace: Path | str | None = None,
         console: bool = False,
         env: bool = True,
+        config_file: bool | str | Path | None = True,
         **overrides: Any,
     ) -> None:
         base = config or AgentConfig()
+        #: The config file this instance was resolved from, when there was one.
+        self.config_file = self.locate_config(config_file)
+        if self.config_file is not None:
+            base = base.with_file(self.config_file)
         self.config = (base.with_env() if env else base).merge(**overrides)
         self.events = events or EventBus()
         self.prompts = prompts or PromptRenderer()
@@ -2707,6 +2905,23 @@ class Engine:
             self.renderer.attach(self.events)
 
     # -- configuration ------------------------------------------------------
+
+    @staticmethod
+    def locate_config(config_file: bool | str | Path | None = True) -> Path | None:
+        """Resolve the ``config_file`` argument to a path, or to nothing.
+
+        ``True`` searches (`find_config_file`), ``False`` or ``None`` skips the
+        file layer entirely, and a path is taken as given — a path that does not
+        exist is an error, because the caller asked for that file by name.
+        """
+        if config_file is None or config_file is False:
+            return None
+        if config_file is True:
+            return find_config_file()
+        file = Path(config_file).expanduser()
+        if not file.is_file():
+            raise FileNotFoundError(f"no such config file: {file}")
+        return file
 
     def resolve_config(self, config: AgentConfig | None = None, **overrides: Any) -> AgentConfig:
         """Resolve the config used for a run.
@@ -3231,6 +3446,7 @@ class Agent(Engine):
         repos: "RepoManager | None" = None,
         commands: CommandRegistry | None = None,
         console: bool = True,
+        config_file: bool | str | Path | None = True,
         **overrides: Any,
     ) -> None:
         super().__init__(
@@ -3241,6 +3457,7 @@ class Agent(Engine):
             tools=tools,
             models=models,
             console=console,
+            config_file=config_file,
             **overrides,
         )
         self.store = store or SqliteStore(self.config.db_path)
@@ -3616,24 +3833,343 @@ class Agent(Engine):
         """Run the REST + websocket server backed by this agent."""
         await WebServer(self, **overrides).serve()
 
+    def repl(self, **overrides: Any) -> "Repl":
+        """The interactive terminal for this agent. Override to swap the class."""
+        return Repl(self, **overrides)
+
     @classmethod
-    def cli(cls, template: str, argv: list[str] | None = None, **kwargs: Any) -> int:
-        """Run this agent as a CLI application. Returns a process exit code."""
+    def cli(cls, template: str | None = None, argv: list[str] | None = None, **kwargs: Any) -> int:
+        """Run this agent as a CLI application. Returns a process exit code.
+
+        Without a template the one `load_template` resolves is used, which the
+        config file, ``AGENT_TEMPLATE`` or an ``agent_prompt.md`` beside the
+        module can all supply.
+        """
         args = parse_args(argv)
+        kwargs.setdefault("config_file", args.config or True)
         agent = cls(**kwargs)
-        return asyncio.run(agent.execute(template, args))
+        return asyncio.run(agent.execute(template or load_template(agent.config), args))
 
     async def execute(self, template: str, args: argparse.Namespace) -> int:
-        """Dispatch parsed CLI arguments to the run or serve path."""
+        """Dispatch parsed CLI arguments to the repl, the run or the serve path.
+
+        ``--serve`` wins, then an explicit ``--repl``, then ``--input``; with no
+        arguments at all the terminal opens, because a harness with nothing to
+        do is a harness waiting to be talked to.
+        """
+        self.template = template
         try:
             if args.serve:
-                self.template = template
                 await self.serve()
                 return 0
+            if args.repl or not args.input:
+                return await self.repl().start(opening=args.input)
             result = await self.run(template, input=args.input)
             return 0 if result.ok else 1
         finally:
             await self.aclose()
+
+
+# ---------------------------------------------------------------------------
+# Repl
+#
+# The terminal client: the same loop the web layer drives, reading lines from a
+# terminal instead of a websocket. It wraps an agent harness instance and owns
+# nothing of its own but the session it is pointed at.
+# ---------------------------------------------------------------------------
+
+
+class Repl:
+    """An interactive terminal for an agent harness.
+
+    Wrap any `Agent` (or a subclass) and call `start`::
+
+        agent = Agent()
+        await Repl(agent).start()
+
+    A line that begins with ``/`` is dispatched to the agent's command registry,
+    exactly as the web client dispatches it, and anything else is a prompt: it
+    runs the agent's template in the current session and streams the answer
+    through the agent's console renderer. The conversation is remembered, so the
+    session carries from one prompt to the next until ``/new`` or ``/end``.
+
+    Lines are read on a dedicated thread, so the event loop keeps running while
+    the terminal waits: timers fire, the session sweeper sweeps and a run that is
+    already streaming is never blocked by the prompt. Ctrl-C cancels the active
+    run and leaves the repl open; Ctrl-D, ``/exit`` or ``/quit`` leaves it.
+    """
+
+    #: Commands the repl answers itself instead of passing to the agent.
+    EXITS = ("exit", "quit")
+    PROMPT = "> "
+
+    def __init__(
+        self,
+        agent: "Agent",
+        *,
+        template: str | None = None,
+        prompt: str | None = None,
+        stream: Any = None,
+        reader: Callable[[str], str] | None = None,
+    ) -> None:
+        self.agent = agent
+        self.template = (
+            template or getattr(agent, "template", None) or PASSTHROUGH_TEMPLATE
+        )
+        self.prompt = self.PROMPT if prompt is None else prompt
+        self.stream = stream or sys.stdout
+        #: Reads one line, given the prompt to show. Injected by the tests.
+        self.reader = reader or self.read_line
+        self.session: Session | None = None
+        self.task: "asyncio.Task[Any] | None" = None
+        self.running = False
+        self._asks: "queue.Queue[str | None]" = queue.Queue()
+        self._lines: "asyncio.Queue[str | None] | None" = None
+        self._thread: threading.Thread | None = None
+
+    # -- loop ---------------------------------------------------------------
+
+    async def start(self, opening: str = "") -> int:
+        """Read and answer until the user leaves. Returns a process exit code.
+
+        `opening` is answered first, which is how ``--repl --input ...`` hands
+        the command line prompt to an interactive session.
+        """
+        self.session = self.agent.sessions.ensure(None)
+        await self.agent.prepare_session(self.session)
+        self.agent.sessions.start_sweeper()
+        self.greet()
+        disarm = self.arm_interrupt()
+        self.running = True
+        try:
+            if opening.strip():
+                await self.dispatch(opening.strip())
+            while self.running:
+                line = await self.read()
+                if line is None:  # Ctrl-D
+                    self.emit("output", "\n")
+                    break
+                if line.strip():
+                    await self.dispatch(line.strip())
+        finally:
+            self.running = False
+            disarm()
+            self.stop_reader()
+        return 0
+
+    async def dispatch(self, text: str) -> None:
+        """Answer one line: a slash command, or a prompt for the agent."""
+        parsed = CommandRegistry.parse(text)
+        if parsed is None:
+            await self.ask(text)
+            return
+        await self.command(text, parsed[0])
+
+    async def ask(self, text: str) -> None:
+        """Run one prompt in the current session, streaming the answer."""
+        session = self.current()
+        self.task = asyncio.create_task(
+            self.agent.run(self.template, session=session, input=text)
+        )
+        try:
+            await self.task
+        except asyncio.CancelledError:
+            self.emit("error", "\n(cancelled)\n")
+            current = asyncio.current_task()
+            if current is not None and current.cancelling():
+                raise  # the repl itself is going away, not just this run
+        except Exception as exc:  # the run reported it; the repl stays open
+            self.emit("error", f"{exc}\n")
+        finally:
+            self.task = None
+
+    async def command(self, text: str, name: str = "") -> None:
+        """Invoke a slash command and report what it returned."""
+        name = name or (CommandRegistry.parse(text) or ("", ""))[0]
+        if name in self.EXITS:
+            self.running = False
+            return
+        result = await self.agent.commands.invoke(
+            text, session_id=self.session.id if self.session else None, repl=self
+        )
+        self.adopt(result)
+        self.report(result)
+
+    # -- session ------------------------------------------------------------
+
+    def current(self) -> Session:
+        """The session prompts run in, replacing one that has gone away."""
+        live = self.agent.sessions.get(self.session.id) if self.session else None
+        if live is None:
+            live = self.agent.sessions.ensure(None)
+        self.session = live
+        return live
+
+    def adopt(self, result: Any) -> None:
+        """Follow a command that started, switched or ended a session."""
+        if not isinstance(result, dict) or "session" not in result:
+            return
+        session = result.get("session")
+        if isinstance(session, dict):
+            self.session = self.agent.sessions.get(str(session.get("id"))) or self.session
+        elif session is None and result.get("ok"):
+            self.session = None  # ended; the next prompt opens a fresh one
+
+    # -- input --------------------------------------------------------------
+
+    def read_line(self, prompt: str) -> str | None:
+        """Read one line from the terminal. Returns ``None`` at end of input."""
+        try:
+            return input(prompt)
+        except EOFError:
+            return None
+
+    async def read(self) -> str | None:
+        """Ask the reader thread for the next line, without blocking the loop."""
+        if self._lines is None:
+            self._lines = asyncio.Queue()
+            self.start_reader(asyncio.get_running_loop())
+        self._asks.put(self.prompt)
+        return await self._lines.get()
+
+    def start_reader(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Start the one thread that reads the terminal for this repl."""
+        if self._thread is not None:
+            return
+        with contextlib.suppress(ImportError):
+            import readline  # noqa: F401 - line editing and history for input()
+
+        self._thread = threading.Thread(
+            target=self.pump, args=(loop,), name="repl-reader", daemon=True
+        )
+        self._thread.start()
+
+    def pump(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Reader thread: one line per request, delivered back to the loop."""
+        while True:
+            prompt = self._asks.get()
+            if prompt is None:
+                return
+            try:
+                line = self.reader(prompt)
+            except (EOFError, KeyboardInterrupt):
+                line = None
+            except Exception:  # pragma: no cover - a broken terminal
+                line = None
+            with contextlib.suppress(RuntimeError):
+                loop.call_soon_threadsafe(self.deliver, line)
+
+    def deliver(self, line: str | None) -> None:
+        """Hand a line the reader produced to whoever is waiting for it."""
+        if self._lines is not None:
+            self._lines.put_nowait(line)
+
+    def stop_reader(self) -> None:
+        """Release the reader thread. A blocked ``input()`` ends with stdin."""
+        self._asks.put(None)
+
+    # -- interrupts ---------------------------------------------------------
+
+    def arm_interrupt(self) -> Callable[[], None]:
+        """Make Ctrl-C cancel the active run instead of killing the process.
+
+        Returns the undo. The loop handler is used where there is one (POSIX)
+        and a plain signal handler otherwise, and a platform that allows neither
+        simply keeps its default behaviour.
+        """
+        loop = asyncio.get_running_loop()
+        with contextlib.suppress(NotImplementedError, RuntimeError, ValueError):
+            loop.add_signal_handler(signal.SIGINT, self.interrupt)
+            return lambda: _quietly(loop.remove_signal_handler, signal.SIGINT)
+        previous = signal.getsignal(signal.SIGINT)
+
+        def handler(_signum: int, _frame: Any) -> None:
+            loop.call_soon_threadsafe(self.interrupt)
+
+        with contextlib.suppress(ValueError, OSError, AttributeError):
+            signal.signal(signal.SIGINT, handler)
+            return lambda: _quietly(signal.signal, signal.SIGINT, previous)
+        return lambda: None
+
+    def interrupt(self) -> None:
+        """Ctrl-C: cancel the run in flight, or remind an idle prompt."""
+        if self.task is not None and not self.task.done():
+            self.task.cancel()
+            return
+        self.emit("error", f"\n(/exit or Ctrl-D to leave)\n{self.prompt}")
+
+    # -- output -------------------------------------------------------------
+
+    def emit(self, kind: str, text: str) -> None:
+        """Write through the agent's renderer so spacing stays consistent."""
+        if not text:
+            return
+        renderer = getattr(self.agent, "renderer", None)
+        if renderer is not None:
+            renderer.emit(kind, text)
+            return
+        print(text, end="", file=self.stream, flush=True)
+
+    def greet(self) -> None:
+        """Print the banner the repl opens with."""
+        renderer = getattr(self.agent, "renderer", None)
+        if renderer is None:
+            return
+        renderer.banner(f"{self.agent.config.name} (repl)", self.banner_items())
+        renderer.banners = False  # one banner per repl, not one per run
+
+    def banner_items(self) -> list[tuple[str, str]]:
+        """Key/value rows for the opening banner."""
+        items = [
+            item for item in self.agent.config.banner_items() if item[0] != "Input"
+        ]
+        file = getattr(self.agent, "config_file", None)
+        if file is not None:
+            items.append(("Config", str(file)))
+        if self.session is not None:
+            items.append(("Session", self.session.id))
+            checkout = self.agent.checkout(self.session)
+            if checkout is not None:
+                items.append(("Branch", checkout.branch))
+        items.append(("Commands", "/help, /exit"))
+        return items
+
+    def describe(self) -> list[dict[str, str]]:
+        """The agent's commands plus the ones the repl answers itself."""
+        own = [{"name": "exit", "description": "Leave the repl (/quit, Ctrl-D)"}]
+        return sorted(
+            [*self.agent.commands.describe(), *own], key=lambda c: c["name"]
+        )
+
+    def report(self, result: Any) -> None:
+        """Print what a command returned: a listing, a message, or both."""
+        if result is None:
+            self.emit("error", "Not a command\n")
+            return
+        if not isinstance(result, dict):
+            self.emit("output", f"{result}\n")
+            return
+        lines: list[str] = []
+        if result.get("commands") is not None:
+            width = max((len(c["name"]) for c in self.describe()), default=0)
+            lines += [
+                f"/{c['name']:<{width}}  {c['description']}" for c in self.describe()
+            ]
+        for session in result.get("sessions") or []:
+            marker = "*" if self.session and session["id"] == self.session.id else " "
+            lines.append(f"{marker} {session['id']}  {session['workspace']}")
+        message = str(result.get("message") or "")
+        if message:
+            lines.append(message)
+        if not lines:
+            lines.append("ok" if result.get("ok", True) else "failed")
+        self.emit("output" if result.get("ok", True) else "error", "\n".join(lines) + "\n")
+
+
+def _quietly(action: Callable[..., Any], *args: Any) -> None:
+    """Undo a handler installation without caring that it is already gone."""
+    with contextlib.suppress(ValueError, RuntimeError, OSError, NotImplementedError):
+        action(*args)
 
 
 # ---------------------------------------------------------------------------
@@ -4055,34 +4591,57 @@ PASSTHROUGH_TEMPLATE = "{{ config.input }}"
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    """Parse the two supported arguments: ``--input`` and ``--serve``."""
+    """Parse the supported arguments: ``--input``, ``--repl``, ``--serve``, ``--config``."""
     parser = argparse.ArgumentParser(prog="agent", description=__doc__.splitlines()[0])
     parser.add_argument("--input", default="", help="a prompt file path or raw text")
     parser.add_argument(
+        "--repl",
+        action="store_true",
+        help="chat in the terminal (the default with no arguments)",
+    )
+    parser.add_argument(
         "--serve", action="store_true", help="serve the web UI and websocket hub"
     )
+    parser.add_argument(
+        "--config",
+        default="",
+        help=f"a JSON or YAML config file (default: {STEM}.json|.yaml here or beside {STEM}.py)",
+    )
     return parser.parse_args(argv)
+
+
+def template_candidates(directories: Iterable[Path | str] | None = None) -> list[Path]:
+    """Every template file that is looked at, in order of precedence."""
+    return [
+        directory / f"{STEM}_prompt.md" for directory in config_directories(directories)
+    ]
 
 
 def load_template(config: AgentConfig | None = None) -> str:
     """Resolve the template for the data driven application.
 
-    Looks at ``AGENT_TEMPLATE`` (a path or raw template), then
-    ``./agent_prompt.md``, and finally falls back to passing the input through.
+    Looks at `config.template` — which a config file or ``AGENT_TEMPLATE`` sets,
+    as a path or as the template itself — then ``agent_prompt.md`` in the current
+    directory and next to ``agent.py``, and finally falls back to passing the
+    input through.
     """
-    raw = os.environ.get(f"{ENV_PREFIX}TEMPLATE", "").strip()
+    raw = (getattr(config, "template", "") or "").strip()
+    raw = raw or os.environ.get(f"{ENV_PREFIX}TEMPLATE", "").strip()
     if raw:
         path = Path(raw).expanduser()
-        return path.read_text(encoding="utf-8") if path.is_file() else raw
-    default = ROOT / "agent_prompt.md"
-    if default.is_file():
-        return default.read_text(encoding="utf-8")
+        with contextlib.suppress(OSError, ValueError):
+            if path.is_file():
+                return path.read_text(encoding="utf-8")
+        return raw
+    for default in template_candidates():
+        if default.is_file():
+            return default.read_text(encoding="utf-8")
     return PASSTHROUGH_TEMPLATE
 
 
 def main(argv: list[str] | None = None) -> int:
     """Entry point of the data driven application."""
-    return Agent.cli(load_template(), argv)
+    return Agent.cli(None, argv)
 
 
 if __name__ == "__main__":

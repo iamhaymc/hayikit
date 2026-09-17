@@ -39,6 +39,13 @@ is recorded here: the reasoning behind what exists is in
       of the surface a user actually touches. Add server tests over a real
       websocket and a browser test that drives the page against a stub agent.
 
+- [ ] **Repl ergonomics.** The terminal reads plain lines: there is no history
+      across restarts, no editing beyond what the platform's `input()` gives,
+      no command completion, no multi-line composition and no way to attach a
+      file the way the web client can. Add a history file, tab completion over
+      the command registry and the workspace, an explicit multi-line mode and an
+      `/attach` command.
+
 - [ ] **Forge portability and a richer git workflow.** Pull requests are GitHub
       REST only, clones are shallow by default and the checkout can only commit,
       push and open a pull request. Add GitLab and Gitea (merge requests), let
