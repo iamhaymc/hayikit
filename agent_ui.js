@@ -500,6 +500,14 @@
         case "block.end":
           Blocks.ensure(message.id, message.kind).end();
           break;
+        case "model.retry":
+          Blocks.note(
+            "error",
+            `${message.role || "leader"} model ${message.error_kind || "error"}: ` +
+              `retry ${(Number(message.attempt) || 1) + 1}/${Number(message.attempts) || 1} ` +
+              `in ${(Number(message.delay) || 0).toFixed(1)}s`,
+          );
+          break;
         case "agent.end":
           this.busy(false);
           if (message.error) Blocks.note("error", message.error);

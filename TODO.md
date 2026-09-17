@@ -14,12 +14,6 @@ is recorded here: the reasoning behind what exists is in
       sessions per principal, an origin check on the socket, and rate limiting
       before it is exposed anywhere but localhost.
 
-- [ ] **Resilience of model calls.** There is no timeout, no retry and no
-      backoff around the leader or the specialists: a stalled provider hangs a
-      run until the client gives up, and a rate limit ends it. Add per-request
-      timeouts, bounded retry with jitter on transient failures, a clear error
-      taxonomy on `RunResult`, and token/cost accounting on `agent.end`.
-
 - [ ] **Concurrency limits and fairness.** Nothing bounds how many sessions,
       workspaces, subprocesses or runs exist at once; a handful of clients can
       exhaust the disk or the CPU of the host. Cap concurrent runs and live

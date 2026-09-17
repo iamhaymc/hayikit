@@ -7,7 +7,10 @@ checkout it can commit, push and open a pull request from — and streams the
 result as blocks to the console, to the web UI, or to any subscriber you attach.
 Every tool call is streamed with it: its name, its redacted arguments, its
 outcome and how long it took. A session remembers its conversation, so the next
-run continues it and a client that reconnects gets the discussion back.
+run continues it and a client that reconnects gets the discussion back. Model
+calls are bounded: a timeout per attempt, retries with jittered backoff on the
+failures worth retrying, a named reason on the result when one fails, and the
+tokens and cost of the run reported when it ends.
 
 ```python
 import asyncio
