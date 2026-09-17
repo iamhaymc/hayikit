@@ -23,11 +23,13 @@ is what has been built and why, and [`TODO.md`](TODO.md) is what is left.
 
 `agent.py` is a single flat module divided by commented section banners, in this
 order: **config, events, prompt, storage, sessions, memory, repository,
-resilience, models, tools, console, commands, core, web, cli**. Each section is self-contained and depends
-only on the ones above it, so the file reads top to bottom.
+resilience, models, tools, console, commands, core, repl, web, cli**. Each
+section is self-contained and depends only on the ones above it, so the file
+reads top to bottom.
 
 Dependencies: `openai` and `openai-agents` (the loop), `jinja2` (templates),
-`websockets` (transport), `cachetools` (LRU). Python 3.12 or newer.
+`omegaconf` (config files), `websockets` (transport), `cachetools` (LRU).
+Python 3.12 or newer.
 
 ## 2. Two entry points
 
@@ -42,12 +44,13 @@ for a workspace, or none), builds the SDK agent and streams it, publishing the
 same `agent.*`, `block.*` and `tool.*` events and returning the same
 `RunResult`. It creates no database, no session, no workspace and no console, so
 an application that already has that infrastructure embeds it directly and pays
-for nothing it does not use. `env=False` also keeps the `AGENT_*` environment out
-of the resolved config.
+for nothing it does not use. `env=False` keeps the `AGENT_*` environment out of
+the resolved config, and `config_file=False` keeps a stray `agent.yaml` in the
+working directory of the host process out of it too.
 
 `Agent` subclasses `Engine` and adds the batteries: storage, sessions and their
 workspaces, conversation memory, git checkouts, slash commands, the console
-renderer and the web layer. Both share `resolve_config`, `build_model`,
+renderer, the repl and the web layer. Both share `resolve_config`, `build_model`,
 `build_vision`, `build_tools`, `build_sdk_agent`, `turn`, `stream` and the
 `running()` lifecycle, so an override or an injected collaborator behaves the
 same in either.
@@ -88,21 +91,65 @@ running it again might work.
 
 ## 4. Config
 
-`AgentConfig` is a dataclass with three composition methods:
+`AgentConfig` is a dataclass with five composition methods:
 
 - `merge(**overrides)` — copy with non-`None` overrides applied; unknown keys go
   to `extras`.
-- `with_env(environ)` — copy with `AGENT_<FIELD>` overrides applied, coerced to
-  the annotated type (`int`, `float`, `bool`, `Path`, `str`).
+- `with_data(mapping)` — copy with a parsed mapping applied, coerced to the
+  annotated type (`int`, `float`, `bool`, `Path`, `str`).
+- `with_file(path)` — copy with a JSON or YAML file applied; without a path the
+  one `find_config_file()` locates.
+- `with_env(environ)` — copy with `AGENT_<FIELD>` overrides applied, coerced the
+  same way.
 - `model_spec(role)` — resolve a role to a `ModelSpec`, or `None`.
 
 `__getattr__` falls back to `extras`, so `config.genre` works in a template when
 `genre` was passed as an override. `to_dict(redact=True)` masks anything
 `is_secret_key()` recognizes, and `banner_items()` is the console summary.
 
-Resolution order is **defaults → environment → explicit arguments**, applied in
-`Agent.__init__` (`AgentConfig().with_env().merge(**overrides)`) and again per
-run in `resolve_config()`.
+Resolution order is **defaults → config file → environment → explicit
+arguments**, applied in `Engine.__init__` and again per run in
+`resolve_config()`.
+
+### Config files
+
+`find_config_file()` looks for `<stem>.json`, `<stem>.yaml` and `<stem>.yml`,
+where the stem is the name of the module itself (`agent`), in the current
+directory first and in the directory of `agent.py` as a fallback — so an
+application overrides whatever ships beside the harness. The first file that
+exists wins; there is no merging between them.
+
+- `config_directories()` is the search path, `config_candidates()` every path
+  that is looked at, in order, and `read_config_file(path)` the reader.
+- Files are parsed with `omegaconf`, so `${oc.env:VAR}` and `${other.key}`
+  interpolations resolve at read time. Without it JSON still works and YAML
+  falls back to `pyyaml`.
+- `flatten_config()` flattens a nested group onto field names — `vision: {model:
+  v}` becomes `vision_model` — but only when every key of the group names a real
+  field. Anything else stays as it is and becomes an extra, and a nested
+  `extras:` mapping is folded in as is.
+- A `null` value leaves the default in place, an empty file is harmless and a
+  file that is not a mapping is an error.
+
+`Engine(config_file=...)` decides what the layer reads: `True` (the default)
+searches, `False` or `None` skips the layer, and a path is taken as given — a
+path that does not exist raises, because the caller named that file. The
+resolved path stays on the instance as `engine.config_file`, which is what the
+repl banner reports. `--config path` is the same switch from the command line.
+
+```yaml
+# agent.yaml
+name: scribe
+model: some/leader-model
+api_key: ${oc.env:AGENT_API_KEY}
+vision:
+  model: some/vision-model
+  max_tokens: 2048
+memory:
+  summary: true
+template: ./prompt.md
+genre: noir
+```
 
 ### Configuration reference
 
@@ -125,6 +172,7 @@ run in `resolve_config()`.
 | `AGENT_SUMMARY_MODEL`, `AGENT_SUMMARY_API_URL`, `AGENT_SUMMARY_API_KEY` | Summary role (defaults to the leader) |
 | `AGENT_SUMMARY_INSTRUCTIONS`, `AGENT_SUMMARY_MAX_TOKENS`    | Summary system prompt and answer budget     |
 | `AGENT_INPUT_SOURCE`                                        | Input path or text (also `--input`)         |
+| `AGENT_TEMPLATE`                                            | Template path or raw template for `main()`  |
 | `AGENT_WORKSPACE_ROOT`, `AGENT_WORKSPACE_SEED`              | Parent of workspaces; directory copied in   |
 | `AGENT_SESSION_TTL`, `AGENT_KEEP_WORKSPACE`                 | Session lifetime; keep the directory        |
 | `AGENT_SESSION_DURABLE`, `AGENT_SESSION_SWEEP_INTERVAL`      | Survive a restart; expiry sweep period      |
@@ -136,7 +184,6 @@ run in `resolve_config()`.
 | `AGENT_SHELL_TIMEOUT`, `AGENT_SHELL_ENABLED`                | Shell tool limits                           |
 | `AGENT_HOST`, `AGENT_PORT`, `AGENT_THEME`                   | Web bind address and UI theme file          |
 | `AGENT_QUIET`, `AGENT_COLOR`                                | Console output                              |
-| `AGENT_TEMPLATE`                                            | Template path or raw template for `main()`  |
 
 Anything not listed is an extra: pass it as a constructor override and read it in
 the template as `config.<name>`.
@@ -406,7 +453,9 @@ reasoning, dim tool, red error), prints every tool call as `-> name(args)` and
 its outcome as `<- name: ok in 12 ms` followed by the result, and disables colour
 when the stream is not a TTY
 or `AGENT_COLOR` says so. `write()`, `style()` and `banner()` are the override
-points; `Agent(console=False)` or `AGENT_QUIET=1` removes it entirely.
+points; `banners=False` keeps the config banner from being printed on every run
+(which is what `Repl` does after printing its own), and `Agent(console=False)` or
+`AGENT_QUIET=1` removes the renderer entirely.
 
 ## 15. Commands
 
@@ -435,7 +484,8 @@ client.
 | `/pr <title>`       | Open a pull request (body on the following lines) |
 | `/publish <title>`  | Commit, push and open the pull request            |
 
-`/clear` and `/theme` are client-side only and never reach the server.
+`/clear` and `/theme` are client-side only and never reach the server, and
+`/exit` (with `/quit`) is answered by the repl rather than the registry.
 
 ## 16. Core
 
@@ -482,7 +532,44 @@ key that looks like a credential (`token`, `password`, `api_key`, … — the
 workspace and clears the cache and the store; `aclose()` does it off the loop and
 both classes are async context managers.
 
-## 17. Web layer
+## 17. Repl
+
+`Repl` is the terminal client: the loop the web layer drives, reading lines from
+a terminal instead of a websocket. It takes an agent harness instance and owns
+nothing but the session it points at, so a consumer opens one on its own agent:
+
+```python
+agent = MyAgent()
+await Repl(agent).start()
+```
+
+- A line starting with `/` goes to `agent.commands`, exactly as the web client
+  dispatches it; `/exit` and `/quit` are answered by the repl itself, as is
+  Ctrl-D, and `/help` lists both sets.
+- Anything else is a prompt: it runs `agent.run(template, session=..., input=...)`
+  in the current session and streams the answer through the agent's own
+  `ConsoleRenderer`, so the terminal looks the same as a one shot run.
+- The session carries from prompt to prompt, with its conversation remembered,
+  until `/new` or `/end`. `adopt()` follows whatever a command did to it and
+  `current()` opens a fresh one when the old one is gone.
+- Lines are read on one dedicated thread that is asked for a line at a time, so
+  the event loop keeps running while the terminal waits: timers fire, the session
+  sweeper sweeps and nothing is blocked by the prompt. `readline` is imported
+  when the platform has it, which is what gives the prompt editing and history.
+- Ctrl-C cancels the run in flight and keeps the repl open (`arm_interrupt()`
+  installs the handler on the loop where there is one and on the signal module
+  otherwise); at an idle prompt it prints a hint instead.
+- The banner is printed once, not per run: `greet()` prints it and turns
+  `ConsoleRenderer.banners` off. It names the model, the config file, the session
+  and the branch when the session has a checkout.
+- `start(opening=...)` answers one prompt before reading, which is how
+  `--repl --input ...` hands the command line prompt to an interactive session.
+
+`reader` is the injection point (`reader(prompt) -> str | None`), which is what
+the tests drive it with, and `Agent.repl(**overrides)` is the factory to override
+to swap the class.
+
+## 18. Web layer
 
 `WebServer` serves three things on one port: the page assets, a read-only REST
 surface and the websocket hub at `/ws`. It subscribes to the bus and forwards
@@ -533,7 +620,7 @@ with sanitized names and passed to the run as `extras["attachments"]`.
 onto the CSS custom properties the page uses, and the result is served at
 `/api/theme` and sent in the `hello` message.
 
-## 18. Web client
+## 19. Web client
 
 `agent_ui.js` is six small subsystems over one socket:
 
@@ -569,16 +656,29 @@ tool and log blocks are monospaced and muted, a tool block keeps its whitespace
 and is labelled with the tool name (turning red when the call failed); a
 streaming block pulses.
 
-## 19. CLI
+## 20. CLI
 
-`parse_args()` accepts exactly `--input` and `--serve`. `load_template()`
-resolves the template from `AGENT_TEMPLATE` (a path or raw text), then
-`./agent_prompt.md`, and finally falls back to passing the input through.
-`Agent.cli(template, argv)` constructs the agent and runs `execute()`, which
-either serves or performs one run and returns a process exit code, closing the
-agent either way.
+`parse_args()` accepts `--input`, `--repl`, `--serve` and `--config`.
+`load_template()` resolves the template from `config.template` (a path or the
+template itself, which the config file or `AGENT_TEMPLATE` sets), then
+`agent_prompt.md` in the current directory and next to `agent.py`, and finally
+falls back to passing the input through.
 
-## 20. Extending
+`Agent.cli(template, argv)` parses the arguments, passes `--config` to the
+constructor as `config_file` and runs `execute()`, which dispatches and returns a
+process exit code, closing the agent either way:
+
+- `--serve` wins: the web layer is served.
+- then `--repl`: the terminal opens, with `--input` as its opening prompt.
+- then `--input`: one run, streamed to the console, exit code `1` when it failed.
+- with no arguments at all the terminal opens, because a harness with nothing to
+  do is a harness waiting to be talked to.
+
+`main()` is the packaged entry point (`agent` on the command line): it builds the
+agent, lets it resolve its config file and environment, and takes the template
+from there.
+
+## 21. Extending
 
 Everything is a hook, an injectable collaborator or a registry entry. Start from
 `Engine` when the application owns its own sessions and history, and from
@@ -598,7 +698,8 @@ class MyAgent(Agent):
     def build_prompt(self, template, config, **context):
         return super().build_prompt(template, config, **context) + "\nBe brief."
 
-agent = MyAgent(store=RedisStore(), cache=MyCache(), console=False)
+agent = MyAgent(store=RedisStore(), cache=MyCache(), console=False,
+                config_file="settings.yaml")
 agent.events.on(EventType.BLOCK_DELTA, my_streamer)     # replace printing
 agent.tools.register("search", lambda ws: my_search_tool)
 agent.commands.register("mode", "Switch mode", my_handler)
@@ -609,7 +710,8 @@ Common overrides: `resolve_config`, `build_prompt`, `decorate_prompt`,
 `build_sdk_agent`, `build_input`, `build_policy`, `stall_timeout`, `remember`,
 `turn`, `stream`, `prepare_session`,
 `register_default_commands`, `ConversationMemory.trim`, `ConsoleRenderer.write` /
-`.style`, `WebServer.encode` / `.rest` / `.register_handlers`, `Hub.connected`.
+`.style`, `Agent.repl` / `Repl.report` / `.banner_items` / `.reader`,
+`WebServer.encode` / `.rest` / `.register_handlers`, `Hub.connected`.
 
 Injectable collaborators: `events`, `renderer`, `prompts`, `tools`, `models`,
 `store`, `cache`, `sessions`, `memory`, `repos`, `commands`.
@@ -623,7 +725,7 @@ Bounding a deployment differently: override `build_policy()` to return a
 provider misreports, or override `Usage.price` (or read `result.usage` on
 `agent.end`) for per-model pricing.
 
-## 21. Tests
+## 22. Tests
 
 ```
 python -m unittest agent_test -v
@@ -640,10 +742,12 @@ reconciliation, reaping and the sweeper), conversation memory (persistence,
 trimming, summarising, replay), workspace path scoping (including symlinks and
 shell timeouts), tool assembly (vision on and off, guarded errors), repository
 URL normalization, git operations against local fixture repositories, pull
-request posting against a stubbed forge, command parsing and the websocket
-protocol codec. No test needs a network or a model.
+request posting against a stubbed forge, command parsing, config file resolution
+(search order, JSON and YAML, nested groups, coercion, the layers around it), the
+repl (prompts, commands, sessions, interrupts, the banner) driven by an injected
+reader, and the websocket protocol codec. No test needs a network or a model.
 
-## 22. Example consumer
+## 23. Example consumer
 
 [`utils/storynu`](../storynu) owns only its content: `story_prompt.md`, a Jinja
 template that injects `config.input`, and `story.py`, which subclasses `Agent` to

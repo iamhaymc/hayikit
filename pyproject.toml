@@ -7,6 +7,7 @@ dependencies = [
     "openai",
     "openai-agents",
     "jinja2",
+    "omegaconf",
     "websockets",
     "cachetools",
     "transformers @ git+https://github.com/huggingface/transformers",

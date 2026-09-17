@@ -9,9 +9,13 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import io
 import json
+import os
+import shutil
 import subprocess
 import tempfile
+import textwrap
 import types
 import unittest
 import unittest.mock
@@ -2189,26 +2193,367 @@ class WebServerTest(unittest.TestCase):
         self.assertEqual(A.safe_name("a b?c.txt"), "a_b_c.txt")
 
 
+class ConfigFileTest(unittest.TestCase):
+    """The file layer: JSON or YAML, the cwd first and the module next to it."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def write(self, name: str, text: str) -> Path:
+        path = self.tmp / name
+        path.write_text(textwrap.dedent(text).strip() + "\n", encoding="utf-8")
+        return path
+
+    def test_candidates_are_the_cwd_then_the_module_directory(self):
+        names = [p.name for p in A.config_candidates(directories=[self.tmp])]
+        self.assertEqual(names, ["agent.json", "agent.yaml", "agent.yml"])
+        directories = A.config_directories()
+        self.assertEqual(directories[0], Path.cwd())
+        self.assertIn(A.ROOT, directories)
+
+    def test_the_cwd_wins_over_the_module_directory(self):
+        near, far = self.tmp / "near", self.tmp / "far"
+        near.mkdir()
+        far.mkdir()
+        (far / "agent.yaml").write_text("model: far\n", encoding="utf-8")
+        self.assertEqual(
+            A.find_config_file(directories=[near, far]), far / "agent.yaml"
+        )
+        (near / "agent.yaml").write_text("model: near\n", encoding="utf-8")
+        self.assertEqual(
+            A.find_config_file(directories=[near, far]), near / "agent.yaml"
+        )
+
+    def test_a_missing_file_is_not_a_find(self):
+        self.assertIsNone(A.find_config_file(directories=[self.tmp]))
+
+    def test_json_and_yaml_read_the_same_way(self):
+        js = self.write("agent.json", '{"model": "j", "port": 9001}')
+        ya = self.write("agent.yaml", "model: y\nport: 9002")
+        self.assertEqual(A.read_config_file(js)["model"], "j")
+        self.assertEqual(A.read_config_file(ya)["port"], 9002)
+
+    def test_values_are_coerced_to_the_field_types(self):
+        path = self.write(
+            "agent.yaml",
+            """
+            model: file-model
+            port: 9100
+            quiet: true
+            theme: /tmp/theme.json
+            retry_backoff: 2
+            max_turns: "7"
+            """,
+        )
+        config = A.AgentConfig().with_file(path)
+        self.assertEqual(config.model, "file-model")
+        self.assertEqual(config.port, 9100)
+        self.assertIs(config.quiet, True)
+        self.assertEqual(config.theme, Path("/tmp/theme.json"))
+        self.assertEqual(config.retry_backoff, 2.0)
+        self.assertEqual(config.max_turns, 7)
+
+    def test_nested_groups_flatten_onto_field_names(self):
+        path = self.write(
+            "agent.yaml",
+            """
+            vision:
+              model: eyes
+              max_tokens: 33
+            memory:
+              enabled: false
+            """,
+        )
+        config = A.AgentConfig().with_file(path)
+        self.assertEqual(config.vision_model, "eyes")
+        self.assertEqual(config.vision_max_tokens, 33)
+        self.assertFalse(config.memory_enabled)
+
+    def test_unknown_keys_and_nested_extras_land_in_extras(self):
+        path = self.write(
+            "agent.yaml",
+            """
+            genre: noir
+            profile:
+              tone: dry
+            extras:
+              mood: calm
+            """,
+        )
+        config = A.AgentConfig().with_file(path)
+        self.assertEqual(config.genre, "noir")
+        self.assertEqual(config.profile, {"tone": "dry"})
+        self.assertEqual(config.mood, "calm")
+
+    def test_null_leaves_the_default_in_place(self):
+        path = self.write("agent.yaml", "model: null")
+        self.assertEqual(A.AgentConfig().with_file(path).model, A.DEFAULT_MODEL)
+
+    def test_an_empty_file_is_harmless(self):
+        self.assertEqual(A.read_config_file(self.write("agent.yaml", "")), {})
+
+    def test_a_file_that_is_not_a_mapping_is_rejected(self):
+        path = self.write("agent.json", "[1, 2, 3]")
+        with self.assertRaises(ValueError):
+            A.read_config_file(path)
+
+    def test_without_a_path_nothing_found_means_no_change(self):
+        with unittest.mock.patch.object(A, "find_config_file", return_value=None):
+            self.assertEqual(A.AgentConfig(model="m").with_file().model, "m")
+
+    def test_the_engine_layers_file_then_environment_then_arguments(self):
+        path = self.write("agent.yaml", "model: from-file\nport: 9100")
+        engine = A.Engine(config_file=path, env=False)
+        self.assertEqual(engine.config_file, path)
+        self.assertEqual(engine.config.model, "from-file")
+        self.assertEqual(engine.config.port, 9100)
+        with unittest.mock.patch.dict(
+            "os.environ", {"AGENT_MODEL": "from-env"}, clear=False
+        ):
+            engine = A.Engine(config_file=path)
+            self.assertEqual(engine.config.model, "from-env")
+            self.assertEqual(engine.config.port, 9100)
+            engine = A.Engine(config_file=path, model="from-argument")
+            self.assertEqual(engine.config.model, "from-argument")
+
+    def test_a_file_in_the_working_directory_is_found_on_its_own(self):
+        self.write("agent.yaml", "model: from-the-cwd")
+        cwd = os.getcwd()
+        self.addCleanup(os.chdir, cwd)
+        os.chdir(self.tmp)
+        self.assertEqual(A.Engine(env=False).config.model, "from-the-cwd")
+        self.assertIsNone(A.Engine(config_file=False, env=False).config_file)
+        self.assertEqual(
+            A.Engine(config_file=False, env=False).config.model, A.DEFAULT_MODEL
+        )
+
+    def test_a_named_file_that_does_not_exist_is_an_error(self):
+        with self.assertRaises(FileNotFoundError):
+            A.Engine(config_file=self.tmp / "nowhere.yaml")
+
+    def test_an_agent_reads_the_same_layer(self):
+        path = self.write("agent.yaml", "name: scribe\nmemory_max_turns: 5")
+        agent = A.Agent(console=False, store=A.MemoryStore(), config_file=path)
+        self.addCleanup(agent.close)
+        self.assertEqual(agent.config.name, "scribe")
+        self.assertEqual(agent.memory.max_turns, 5)
+
+
+class ReplTest(unittest.TestCase):
+    """The terminal client, driven by an injected reader."""
+
+    class ReplAgent(A.Agent):
+        """An agent whose runs are recorded instead of performed."""
+
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.asked: list[str] = []
+
+        async def run(self, template, *, config=None, session=None, context=None, **overrides):
+            self.asked.append(str(overrides.get("input", "")))
+            result = A.RunResult(session_id=getattr(session, "id", ""))
+            result.output = f"echo: {overrides.get('input', '')}"
+            return result
+
+    def setUp(self):
+        self.out = io.StringIO()
+        self.agent = self.ReplAgent(
+            console=False,
+            store=A.MemoryStore(),
+            config_file=False,
+            renderer=A.ConsoleRenderer(color=False, stream=self.out),
+        )
+        self.addCleanup(self.agent.close)
+
+    def repl(self, lines, **kwargs):
+        feed = iter(lines)
+        return self.agent.repl(reader=lambda prompt: next(feed), **kwargs)
+
+    def test_a_plain_line_is_a_prompt_and_exit_leaves(self):
+        repl = self.repl(["hello", "/exit", "never"])
+        self.assertEqual(run(repl.start()), 0)
+        self.assertEqual(self.agent.asked, ["hello"])
+
+    def test_end_of_input_leaves(self):
+        repl = self.repl(["one", None])
+        run(repl.start())
+        self.assertEqual(self.agent.asked, ["one"])
+
+    def test_blank_lines_are_ignored(self):
+        repl = self.repl(["", "   ", None])
+        run(repl.start())
+        self.assertEqual(self.agent.asked, [])
+
+    def test_an_opening_prompt_is_answered_first(self):
+        repl = self.repl([None])
+        run(repl.start(opening="from the command line"))
+        self.assertEqual(self.agent.asked, ["from the command line"])
+
+    def test_a_slash_line_is_a_command(self):
+        repl = self.repl(["/model tiny", None])
+        run(repl.start())
+        self.assertEqual(self.agent.asked, [])
+        self.assertEqual(self.agent.config.model, "tiny")
+        self.assertIn("Model: tiny", self.out.getvalue())
+
+    def test_help_lists_the_repl_commands_too(self):
+        repl = self.repl(["/help", None])
+        run(repl.start())
+        self.assertIn("/exit", self.out.getvalue())
+        self.assertIn("/publish", self.out.getvalue())
+
+    def test_an_unknown_command_is_reported(self):
+        repl = self.repl(["/nope", None])
+        run(repl.start())
+        self.assertIn("Unknown command: /nope", self.out.getvalue())
+
+    def test_new_and_end_move_the_repl_between_sessions(self):
+        repl = self.repl(["/new", "/end", None])
+        first = self.agent.sessions.ensure(None)
+        repl.session = first
+        run(repl.start())
+        self.assertIsNone(repl.session)
+        self.assertNotEqual(repl.current().id, first.id)
+
+    def test_the_banner_is_printed_once_not_per_run(self):
+        repl = self.repl(["hello", None])
+        run(repl.start())
+        self.assertEqual(self.out.getvalue().count("(repl)"), 1)
+        self.assertFalse(self.agent.renderer.banners)
+
+    def test_the_banner_names_the_config_file_and_session(self):
+        repl = self.repl([None])
+        repl.session = self.agent.sessions.ensure(None)
+        self.agent.config_file = Path("/somewhere/agent.yaml")
+        labels = [label for label, _ in repl.banner_items()]
+        self.assertIn("Config", labels)
+        self.assertIn("Session", labels)
+        self.assertNotIn("Input", labels)
+
+    def test_a_failing_run_keeps_the_repl_open(self):
+        async def boom(*_args, **_kwargs):
+            raise RuntimeError("model is down")
+
+        self.agent.run = boom
+        repl = self.repl(["one", "two", None])
+        run(repl.start())
+        self.assertEqual(self.out.getvalue().count("model is down"), 2)
+
+    def test_an_interrupt_cancels_the_run_and_stays_open(self):
+        async def forever(*_args, **_kwargs):
+            await asyncio.sleep(30)
+
+        self.agent.run = forever
+
+        async def drive():
+            repl = self.repl(["slow", None])
+
+            async def interrupt():
+                while repl.task is None:
+                    await asyncio.sleep(0.01)
+                repl.interrupt()
+
+            asyncio.get_running_loop().create_task(interrupt())
+            return await repl.start()
+
+        self.assertEqual(run(drive()), 0)
+        self.assertIn("(cancelled)", self.out.getvalue())
+
+    def test_cancelling_the_repl_itself_stops_it(self):
+        async def forever(*_args, **_kwargs):
+            await asyncio.sleep(30)
+
+        self.agent.run = forever
+
+        async def drive():
+            repl = self.repl(["slow", None])
+            task = asyncio.create_task(repl.start())
+            while repl.task is None:
+                await asyncio.sleep(0.01)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            self.assertFalse(repl.running)
+
+        run(drive())
+
+    def test_an_idle_interrupt_only_prints_a_hint(self):
+        repl = self.repl([None])
+        repl.interrupt()
+        self.assertIn("Ctrl-D to leave", self.out.getvalue())
+
+    def test_the_agent_builds_its_own_repl(self):
+        self.assertIsInstance(self.agent.repl(), A.Repl)
+
+
 class CliTest(unittest.TestCase):
-    def test_only_input_and_serve_are_accepted(self):
+    def test_the_accepted_arguments(self):
         args = A.parse_args(["--input", "notes.md", "--serve"])
         self.assertEqual(args.input, "notes.md")
         self.assertTrue(args.serve)
-        self.assertEqual(vars(A.parse_args([])), {"input": "", "serve": False})
+        self.assertEqual(
+            vars(A.parse_args([])),
+            {"input": "", "repl": False, "serve": False, "config": ""},
+        )
+        self.assertTrue(A.parse_args(["--repl"]).repl)
+        self.assertEqual(A.parse_args(["--config", "c.yaml"]).config, "c.yaml")
         with self.assertRaises(SystemExit):
             A.parse_args(["--unknown"])
+
+    def test_no_arguments_open_the_repl(self):
+        agent = A.Agent(console=False, store=A.MemoryStore(), config_file=False)
+        opened: list[str] = []
+
+        class FakeRepl:
+            async def start(self, opening=""):
+                opened.append(opening)
+                return 0
+
+        agent.repl = lambda **_: FakeRepl()
+        self.assertEqual(run(agent.execute("T", A.parse_args([]))), 0)
+        self.assertEqual(opened, [""])
+
+    def test_an_input_argument_performs_one_run(self):
+        agent = A.Agent(console=False, store=A.MemoryStore(), config_file=False)
+        ran: list[str] = []
+
+        async def fake_run(template, **overrides):
+            ran.append(overrides.get("input", ""))
+            return A.RunResult(session_id="s")
+
+        agent.run = fake_run
+        self.assertEqual(run(agent.execute("T", A.parse_args(["--input", "hi"]))), 0)
+        self.assertEqual(ran, ["hi"])
 
     def test_template_resolution_prefers_the_environment(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "p.md"
             path.write_text("from file", encoding="utf-8")
-            import os
-
             os.environ["AGENT_TEMPLATE"] = str(path)
             self.addCleanup(os.environ.pop, "AGENT_TEMPLATE", None)
             self.assertEqual(A.load_template(), "from file")
             os.environ["AGENT_TEMPLATE"] = "raw {{ config.input }}"
             self.assertEqual(A.load_template(), "raw {{ config.input }}")
+
+    def test_template_resolution_prefers_the_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "p.md"
+            path.write_text("from config", encoding="utf-8")
+            config = A.AgentConfig(template=str(path))
+            self.assertEqual(A.load_template(config), "from config")
+            self.assertEqual(
+                A.load_template(A.AgentConfig(template="raw one")), "raw one"
+            )
+
+    def test_template_candidates_follow_the_config_directories(self):
+        names = {p.name for p in A.template_candidates()}
+        self.assertEqual(names, {"agent_prompt.md"})
+        self.assertIn(A.ROOT / "agent_prompt.md", A.template_candidates())
+
+    def test_the_passthrough_template_is_the_last_resort(self):
+        with unittest.mock.patch.object(A, "template_candidates", return_value=[]):
+            self.assertEqual(A.load_template(A.AgentConfig()), A.PASSTHROUGH_TEMPLATE)
 
 
 if __name__ == "__main__":

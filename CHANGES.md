@@ -40,9 +40,10 @@ version, with the phase log and the fixes at the end.
 - **A run leaves no trace.** Work happens inside a session that owns a temporary
   directory; closing or expiring the session removes the directory, its database
   record and its cache entry.
-- **One implementation, three front ends.** The same `Agent` drives the console,
-  the CLI and the web UI, because printing and streaming are event subscribers
-  rather than code paths inside the loop.
+- **One implementation, every front end.** The same `Agent` drives a one shot
+  console run, the terminal repl and the web UI, because printing and streaming
+  are event subscribers rather than code paths inside the loop, and because the
+  repl and the web server are both clients of the same command registry.
 - **Secrets never leak.** Credentials are masked in every serialization, banner
   and command output, and are never written to disk.
 
@@ -74,10 +75,11 @@ version, with the phase log and the fixes at the end.
 
 ## Configuration
 
-`AgentConfig` is a dataclass resolved in layers: dataclass defaults, then
-`AGENT_*` environment variables, then whatever the consumer or the CLI passes
-in. Layering in that order is what lets the same object serve a library caller,
-a shell and a deployment without any of them knowing about the others.
+`AgentConfig` is a dataclass resolved in layers: dataclass defaults, then a JSON
+or YAML file, then `AGENT_*` environment variables, then whatever the consumer or
+the CLI passes in. Layering in that order is what lets the same object serve a
+library caller, a shell and a deployment without any of them knowing about the
+others.
 
 Values are coerced from the environment against the field annotations, so
 `AGENT_PORT` becomes an `int` and `AGENT_THEME` a `Path` without a schema.
@@ -93,6 +95,38 @@ read, everything else is used as is. That is the whole reason the CLI needs only
 Secrets are recognized by field name (`*_api_key`, `*_token`, `*secret*`, …) and
 masked by `to_dict()` and by the console banner, so a config can be logged,
 served over the REST API or printed without redacting it by hand at each site.
+
+### Config files
+
+The environment is a poor place to keep two dozen settings: it is flat, it is
+untyped, and a deployment ends up with a wrapper script whose only job is to
+export things. A file layer fixes that without becoming a framework.
+
+- **Named after the module.** `agent.json`, `agent.yaml` or `agent.yml` — the
+  stem of `agent.py`. A consumer that renames the module renames its config with
+  it, and nothing needs to be configured to find the configuration.
+- **The current directory first, the module directory as a fallback.** An
+  installed harness ships whatever defaults it likes beside itself; the
+  application that runs it overrides them from where it is run. The first file
+  that exists wins, because merging two files invites the question of which one
+  set what.
+- **Below the environment.** A file is checked in, the environment is not, so
+  `AGENT_API_KEY` must still beat a value in the file — and a credential that
+  belongs nowhere near a repository can be pulled in explicitly with
+  `${oc.env:AGENT_API_KEY}` instead.
+- **omegaconf, not a schema.** It reads both formats and resolves `${...}`
+  interpolations to the environment and to other keys, which is what makes one
+  file serve several environments. It stays optional at runtime: JSON is read by
+  the standard library and YAML falls back to `pyyaml`, so a stripped install
+  still starts.
+- **Nested groups, flattened carefully.** `vision: {model: v}` becomes
+  `vision_model` only when every key of the group names a real field. Anything
+  else is left alone and lands in `extras`, so an application's own nested values
+  survive intact and a typo never silently invents a setting.
+- **Off is a value.** `config_file=False` keeps an embedded engine from reading a
+  stray `agent.yaml` in the working directory of its host, in the same spirit as
+  `env=False`; a named file that does not exist raises, because the caller asked
+  for that file by name.
 
 ## Events
 
@@ -349,9 +383,39 @@ and subscribe their own; nothing in the loop knows it exists.
 
 Slash commands power everything the discussion itself does not: session
 lifecycle, model and vision switching, and every git operation. One registry
-serves both the CLI and the browser, so a command written once is available in
+serves the repl and the browser alike, so a command written once is available in
 both, and the client discovers the list at handshake time instead of hard coding
 it.
+
+## Repl
+
+Running the module with no arguments used to be an error message. It now opens a
+terminal, because the shortest path from an installed harness to a conversation
+should not be a flag, a browser or a Python file — and because a one shot
+`--input` run cannot show the thing the harness is actually built around, a
+session that remembers what was said.
+
+`Repl` takes an agent instance and nothing else, which keeps it a client rather
+than a mode: it dispatches slash commands to the agent's registry exactly as the
+web client does, hands everything else to `agent.run()` and lets the existing
+`ConsoleRenderer` do the printing. A consumer opens one on its own subclass with
+`await Repl(my_agent).start()`, and `Agent.repl()` is the seam for swapping the
+class.
+
+Two details are worth keeping:
+
+- **The terminal must not own the loop.** Lines are read on one dedicated thread
+  that is asked for a line at a time, so timers, the session sweeper and a
+  streaming run keep running while the prompt waits. One thread, not one per
+  line, so a Ctrl-C at the prompt cannot leave two readers racing for the next
+  line — and a daemon thread, so a blocked `input()` cannot hold up exit.
+- **Ctrl-C cancels the run, not the process.** The interrupt is handled on the
+  loop where the platform has a loop handler and through `signal` otherwise; at
+  an idle prompt it prints a hint rather than killing a session the user is in
+  the middle of. Leaving is `/exit`, `/quit` or Ctrl-D.
+
+The banner is printed once instead of once per run (`ConsoleRenderer.banners`),
+which is the only change the repl needed in the console renderer.
 
 ## Web layer
 
@@ -414,7 +478,7 @@ harness.
 8. Core `Agent`: construction from config, `run()`, block streaming,
    cancellation and overridable hooks.
 9. Console renderer: banner and block aware streaming printer, as a subscriber.
-10. CLI layer: `main()` with only `--input` and `--serve`.
+10. CLI layer: `main()` with `--input` and `--serve`.
 11. Web layer: REST plus a websocket hub bridging block events to clients.
 12. Web client: chat UI with out-of-order blocks, markdown and media preview,
     attachments, connection state and a mobile first layout.
@@ -444,6 +508,11 @@ harness.
     `RetryPolicy` (per-attempt timeouts, bounded retries, exponential backoff
     with jitter), the stall guard around the leader's stream, `model.retry` on
     the bus, and `Usage` accounting with pricing on `agent.end`.
+26. Terminal repl and config files: `Repl` as the default entry point of
+    `agent.py`, `--repl` and `--config` beside `--input` and `--serve`, the JSON
+    and YAML file layer between the defaults and the environment
+    (`find_config_file`, `read_config_file`, `AgentConfig.with_file`), and a
+    template that the config file can name.
 
 ## Fixes worth remembering
 

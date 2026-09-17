@@ -1,10 +1,11 @@
 # HAYI
 
 An application agnostic agent harness. One class, `Agent`, is the whole API: it
-resolves its own configuration, renders a prompt template the consumer owns,
-runs the agentic loop inside an isolated session workspace — optionally a git
-checkout it can commit, push and open a pull request from — and streams the
-result as blocks to the console, to the web UI, or to any subscriber you attach.
+resolves its own configuration — defaults, a JSON or YAML file, the environment,
+then arguments — renders a prompt template the consumer owns, runs the agentic
+loop inside an isolated session workspace — optionally a git checkout it can
+commit, push and open a pull request from — and streams the result as blocks to
+the terminal, to the web UI, or to any subscriber you attach.
 Every tool call is streamed with it: its name, its redacted arguments, its
 outcome and how long it took. A session remembers its conversation, so the next
 run continues it and a client that reconnects gets the discussion back. Model
@@ -99,13 +100,46 @@ uv pip install --python .venv/bin/python -e .
 
 ```
 export AGENT_API_KEY=...                # never commit it
+python agent.py                         # chat in the terminal
 python agent.py --input notes.md        # one shot run, streamed to the console
 python agent.py --serve                 # REST API + websocket hub + chat UI
 ```
 
-`--input` and `--serve` are the only command line arguments; everything else is
-configuration (`AGENT_*` environment variables or constructor arguments), for
-example:
+With no arguments the terminal opens: type a message and the answer streams
+back, the session remembers the conversation, `/help` lists the slash commands
+and `/exit` (or Ctrl-D) leaves. Ctrl-C cancels the run in flight and keeps the
+prompt. The same class drives it, so a consumer can open one on its own agent
+with `await Repl(my_agent).start()`.
+
+`--input`, `--repl`, `--serve` and `--config` are the only command line
+arguments; everything else is configuration.
+
+## Configure
+
+Settings are resolved in layers — **defaults → config file → `AGENT_*`
+environment → constructor or CLI arguments** — so the later layer always wins.
+
+A config file is `agent.json`, `agent.yaml` or `agent.yml`: named after
+`agent.py`, looked for in the current directory first and next to `agent.py` as
+a fallback. Point at another one with `--config path` or
+`Agent(config_file="path")`, and switch the layer off entirely with
+`Agent(config_file=False)`.
+
+```yaml
+name: scribe
+model: some/leader-model
+api_key: ${oc.env:AGENT_API_KEY}   # keep the secret in the environment
+vision:                            # a group flattens onto vision_*
+  model: some/vision-model
+repo:
+  url: owner/name
+genre: noir                        # unknown keys are extras: config.genre
+```
+
+Files are read with [omegaconf](https://omegaconf.readthedocs.io), so `${...}`
+interpolations to the environment and to other keys in the file work. The
+equivalent environment is `AGENT_NAME`, `AGENT_MODEL`, `AGENT_VISION_MODEL`,
+`AGENT_REPO_URL`, and so on:
 
 ```
 AGENT_MODEL=some/leader-model \
@@ -116,7 +150,7 @@ python agent.py --serve
 
 In server mode the chat page is at `http://<host>:<port>/` (`127.0.0.1:8765` by
 default). Slash commands (`/help`) manage sessions, models and the repository
-from both the CLI and the UI.
+from the terminal and the UI alike.
 
 ## Test
 
