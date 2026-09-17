@@ -198,6 +198,62 @@ reload or a reconnect restore the discussion instead of showing an empty page
 attached to a model that remembers. `/forget` clears a transcript, and closing a
 session forgets it along with its workspace.
 
+## Resilience
+
+Two failures used to end a run with nothing useful to say: a provider that stops
+answering, which hung the caller until it gave up, and a provider that answers
+with a refusal, which arrived as a string a consumer had to parse. Both are now
+bounded and named.
+
+Naming came first, because retrying is a decision and a decision needs a
+category. `ErrorKind` is that category and `classify_error()` assigns it by
+exception class name, then by HTTP status, then by whether it is an `OSError` —
+in that order, and by *name* rather than by class, so the harness classifies an
+`openai` error, an `httpx` error or a provider SDK nobody has written yet
+without importing any of them. `ErrorKind.TRANSIENT` is the subset another
+identical attempt may get past, which is what `RetryPolicy` consults; everything
+else is a decision of the provider and is reported at once. An unrecognized
+failure classifies as `internal` and is re-raised unchanged rather than wrapped
+in a `ModelError`, because a defect in the harness dressed up as a provider
+fault is worse than no classification at all.
+
+Backoff is exponential with jitter, and the jitter is the point: clients that a
+rate limit failed together will otherwise come back together and reproduce it.
+Retrying is bounded by attempts rather than by a deadline so that a caller can
+reason about the worst case from the configuration alone.
+
+The leader and the specialists are shaped differently, so they are bounded
+differently. A specialist completion is one request and a timeout around the
+whole call is right. The leader's stream is a long lived read whose total
+duration is legitimately unbounded — that is what an agentic loop is — so the
+same setting becomes a stall guard on the wait for the *next* event instead.
+That guard has to know about tools: the SDK runs a tool call inside the stream,
+so the budget is extended by `shell_timeout` while a call is outstanding, or a
+slow shell command would be indistinguishable from a dead provider. And a stream
+is only restarted while it has produced nothing: once a block or a tool call
+exists, a retry would replay work the consumer has already seen and re-run tools
+that already had effects, so the failure is reported instead. That rule, not the
+error kind, is what makes retrying the leader safe.
+
+Retrying in two places at once is worse than retrying in neither: the `openai`
+client retries twice on its own by default, so the first end to end test of this
+work showed a 503 disappearing with nothing on the bus and nothing in the
+accounting. The client is now built with `max_retries=0`. A retry that
+the harness cannot see cannot be reported, jittered by the policy that is
+supposed to own the decision, or counted against the run.
+
+Accounting was folded into the same change because tokens are only knowable
+where the calls are made, and a run makes them in several places: the leader's
+stream, a tool delegating to the vision model, the summariser compressing what
+fell out of memory. Threading a sink through all of them would have put an
+accounting parameter on half the extension points, so the run publishes its
+`Usage` in a context variable for the length of `running()` and every call
+underneath finds it there — and two concurrent runs never collide, because each
+run is its own task. A failed attempt is accounted too: the tokens were spent
+whether or not the answer arrived. Pricing is one rate pair per deployment
+(`cost_input`, `cost_output`, per million tokens) rather than a table per model,
+which covers the common case and leaves the rest to an override of `price`.
+
 ## Models
 
 A run has one **leader** model that drives the agentic loop and, optionally,
@@ -384,6 +440,10 @@ harness.
     `running()` lifecycle and `turn()`, model input taken verbatim, tools from
     the caller or from an optional workspace, and `env=False` for hosts that do
     not want the `AGENT_*` environment read.
+25. Resilience of model calls: the `ErrorKind` taxonomy and `classify_error`,
+    `RetryPolicy` (per-attempt timeouts, bounded retries, exponential backoff
+    with jitter), the stall guard around the leader's stream, `model.retry` on
+    the bus, and `Usage` accounting with pricing on `agent.end`.
 
 ## Fixes worth remembering
 
@@ -404,6 +464,11 @@ harness.
 - **Tool errors ending runs.** Exceptions from tools aborted the loop instead of
   informing the model. One shared guard turns them into `Error: …` text, and it
   is shared by the file and repository tools so both behave identically.
+- **Model calls with no bound.** A stalled provider hung a run until the client
+  gave up and a rate limit ended it outright. Every call is now made under a
+  `RetryPolicy`: a timeout per attempt (a stall guard for the leader's stream),
+  bounded retries with jittered backoff on transient kinds only, and a stream
+  that is only restarted while it has produced nothing.
 - **Tokens reaching disk.** An authenticated clone URL persists in `.git/config`
   by default; the remote is rewritten to the clean URL right after cloning and
   all git output is masked.

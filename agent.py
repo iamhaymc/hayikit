@@ -12,6 +12,7 @@ each be replaced by a consumer:
 | sessions  | `Session`, `SessionManager`                      |
 | memory    | `Turn`, `Transcript`, `ConversationMemory`       |
 | repository| `RepoSpec`, `RepoManager`, `Checkout`            |
+| resilience| `ErrorKind`, `RetryPolicy`, `Usage`              |
 | models    | `ModelSpec`, `ModelPool`                         |
 | tools     | `Workspace`, `ToolRegistry`                      |
 | console   | `ConsoleRenderer`                                |
@@ -41,11 +42,13 @@ import argparse
 import asyncio
 import base64
 import contextlib
+import contextvars
 import functools
 import inspect
 import json
 import mimetypes
 import os
+import random
 import re
 import shutil
 import sqlite3
@@ -75,17 +78,20 @@ __all__ = [
     "ConsoleRenderer",
     "ConversationMemory",
     "Engine",
+    "ErrorKind",
     "Event",
     "EventBus",
     "EventType",
     "Hub",
     "LruCache",
+    "ModelError",
     "ModelPool",
     "ModelSpec",
     "PromptRenderer",
     "RepoError",
     "RepoManager",
     "RepoSpec",
+    "RetryPolicy",
     "RunResult",
     "Session",
     "SessionManager",
@@ -95,6 +101,7 @@ __all__ = [
     "ToolRegistry",
     "Transcript",
     "Turn",
+    "Usage",
     "WebServer",
     "Workspace",
     "main",
@@ -205,6 +212,21 @@ class AgentConfig:
     api_url: str = DEFAULT_API_URL
     api_key: str = ""
     max_turns: int = 100
+    # Resilience of model calls. Every request to a provider is bounded by a
+    # timeout and tried again on a transient failure (a timeout, a rate limit, a
+    # connection error or a 5xx) with exponential backoff and jitter. For the
+    # leader the timeout is a stall guard — the longest the stream may say
+    # nothing, extended by `shell_timeout` while a tool call is outstanding —
+    # and its stream is only restarted while it has produced nothing.
+    request_timeout: float = 120.0
+    retry_attempts: int = 3
+    retry_backoff: float = 0.5
+    retry_max_backoff: float = 30.0
+    retry_jitter: float = 0.5
+    # What a million input / output tokens cost, in whatever currency the
+    # provider bills. Left at zero, `agent.end` reports tokens without a price.
+    cost_input: float = 0.0
+    cost_output: float = 0.0
     # Vision specialist. When `vision_model` is set the leader model never sees
     # image data: image tools delegate to this model and return its answer as
     # text, so a leader without vision can still work with images. The endpoint
@@ -388,6 +410,7 @@ class EventType:
     BLOCK_END = "block.end"
     TOOL_START = "tool.start"
     TOOL_END = "tool.end"
+    MODEL_RETRY = "model.retry"
     SESSION_OPEN = "session.open"
     SESSION_CLOSE = "session.close"
     LOG = "log"
@@ -1419,28 +1442,377 @@ class RepoManager:
 
 
 # ---------------------------------------------------------------------------
+# Resilience
+#
+# Every call to a provider is bounded: one timeout per attempt, a few retries
+# with exponential backoff and jitter on the failures another attempt can get
+# past, and a taxonomy (`ErrorKind`) that tells a consumer which kind of failure
+# it got instead of a string it has to parse. Token accounting rides the same
+# path, because what a run spent is only knowable where its calls are made.
+# ---------------------------------------------------------------------------
+
+
+class ErrorKind:
+    """Why a run failed, as reported on `RunResult.error_kind`."""
+
+    TIMEOUT = "timeout"
+    RATE_LIMIT = "rate_limit"
+    CONNECTION = "connection"
+    SERVER = "server"
+    AUTH = "auth"
+    INVALID = "invalid_request"
+    MAX_TURNS = "max_turns"
+    CANCELLED = "cancelled"
+    INTERNAL = "internal"
+
+    #: The kinds an identical attempt may get past. Everything else is a
+    #: decision of the provider (or a defect here) and is reported at once.
+    TRANSIENT = (TIMEOUT, RATE_LIMIT, CONNECTION, SERVER)
+
+
+#: Exception class names mapped onto the taxonomy. Matching by name keeps the
+#: harness from importing the exception hierarchy of any provider SDK; a class
+#: that is not listed still classifies by the HTTP status it carries.
+ERROR_KINDS = {
+    "APITimeoutError": ErrorKind.TIMEOUT,
+    "TimeoutError": ErrorKind.TIMEOUT,
+    "ReadTimeout": ErrorKind.TIMEOUT,
+    "ConnectTimeout": ErrorKind.TIMEOUT,
+    "APIConnectionError": ErrorKind.CONNECTION,
+    "ConnectionError": ErrorKind.CONNECTION,
+    "ConnectError": ErrorKind.CONNECTION,
+    "RateLimitError": ErrorKind.RATE_LIMIT,
+    "InternalServerError": ErrorKind.SERVER,
+    "AuthenticationError": ErrorKind.AUTH,
+    "PermissionDeniedError": ErrorKind.AUTH,
+    "BadRequestError": ErrorKind.INVALID,
+    "NotFoundError": ErrorKind.INVALID,
+    "UnprocessableEntityError": ErrorKind.INVALID,
+    "MaxTurnsExceeded": ErrorKind.MAX_TURNS,
+}
+
+
+class ModelError(RuntimeError):
+    """A model call that failed, carrying its kind, role and attempt count."""
+
+    def __init__(
+        self,
+        message: str,
+        kind: str = ErrorKind.INTERNAL,
+        *,
+        role: str = LEADER_ROLE,
+        attempts: int = 1,
+        detail: str = "",
+    ) -> None:
+        super().__init__(message)
+        self.kind = kind
+        self.role = role
+        self.attempts = attempts
+        #: What the provider said, without the framing of the message above.
+        self.detail = detail or message
+
+
+def status_kind(status: int) -> str | None:
+    """The taxonomy entry of an HTTP status, or ``None`` when it says nothing."""
+    if status in (408, 504):
+        return ErrorKind.TIMEOUT
+    if status == 429:
+        return ErrorKind.RATE_LIMIT
+    if status in (401, 403):
+        return ErrorKind.AUTH
+    if 500 <= status < 600:
+        return ErrorKind.SERVER
+    if 400 <= status < 500:
+        return ErrorKind.INVALID
+    return None
+
+
+def error_status(exc: BaseException) -> int | None:
+    """The HTTP status of a provider exception, wherever its SDK keeps it."""
+    for holder in (exc, getattr(exc, "response", None)):
+        for name in ("status_code", "status", "http_status"):
+            value = getattr(holder, name, None)
+            if isinstance(value, int):
+                return value
+    return None
+
+
+def classify_error(exc: BaseException) -> str:
+    """Classify a failure as one of the `ErrorKind` values."""
+    if isinstance(exc, ModelError):
+        return exc.kind
+    if isinstance(exc, asyncio.CancelledError):
+        return ErrorKind.CANCELLED
+    for cls in type(exc).__mro__:
+        kind = ERROR_KINDS.get(cls.__name__)
+        if kind is not None:
+            return kind
+    status = error_status(exc)
+    if status is not None:
+        kind = status_kind(status)
+        if kind is not None:
+            return kind
+    if isinstance(exc, OSError):
+        return ErrorKind.CONNECTION
+    return ErrorKind.INTERNAL
+
+
+def model_error(
+    exc: BaseException, kind: str, *, role: str = LEADER_ROLE, attempts: int = 1
+) -> ModelError:
+    """Wrap a failed model call, keeping the message the provider gave."""
+    detail = (
+        exc.detail
+        if isinstance(exc, ModelError)
+        else (str(exc).strip() or type(exc).__name__)
+    )
+    tries = f" after {attempts} attempts" if attempts > 1 else ""
+    return ModelError(
+        f"{role} model {kind}{tries}: {detail}",
+        kind,
+        role=role,
+        attempts=attempts,
+        detail=detail,
+    )
+
+
+def usage_value(raw: Any, *names: str) -> int:
+    """The first of `names` present on a usage payload, as attribute or key."""
+    for name in names:
+        value = raw.get(name) if isinstance(raw, dict) else getattr(raw, name, None)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return int(value)
+    return 0
+
+
+@dataclass
+class Usage:
+    """What was spent: per run on `RunResult`, in total on a `ModelPool`."""
+
+    requests: int = 0
+    retries: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cost: float = 0.0
+
+    @property
+    def total_tokens(self) -> int:
+        return self.input_tokens + self.output_tokens
+
+    def add(
+        self, *, requests: int = 1, input_tokens: int = 0, output_tokens: int = 0
+    ) -> "Usage":
+        self.requests += int(requests)
+        self.input_tokens += int(input_tokens)
+        self.output_tokens += int(output_tokens)
+        return self
+
+    def record(self, raw: Any) -> "Usage":
+        """Accumulate one provider usage payload, under either naming."""
+        if raw is None:
+            return self
+        return self.add(
+            requests=usage_value(raw, "requests") or 1,
+            input_tokens=usage_value(raw, "input_tokens", "prompt_tokens"),
+            output_tokens=usage_value(raw, "output_tokens", "completion_tokens"),
+        )
+
+    def price(self, input_rate: float = 0.0, output_rate: float = 0.0) -> float:
+        """Cost the tokens at rates quoted per million, and keep the result."""
+        spent = self.input_tokens * input_rate + self.output_tokens * output_rate
+        self.cost = spent / 1_000_000
+        return self.cost
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "requests": self.requests,
+            "retries": self.retries,
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens,
+            "total_tokens": self.total_tokens,
+            "cost": round(self.cost, 6),
+        }
+
+
+#: The accounting of the run in progress on this task. A model call made
+#: anywhere below `Engine.running` — a tool delegating to the vision model, the
+#: summariser of the memory — finds its sink here instead of being handed one,
+#: and two concurrent runs never share it because each run is its own task.
+_USAGE: "contextvars.ContextVar[Usage | None]" = contextvars.ContextVar(
+    "agent_usage", default=None
+)
+
+
+def current_usage() -> Usage | None:
+    """The `Usage` of the run in progress on this task, when there is one."""
+    return _USAGE.get()
+
+
+def record_usage(raw: Any, *sinks: "Usage | None") -> None:
+    """Accumulate one provider usage payload onto each distinct sink given."""
+    accounted: list[Usage] = []
+    for sink in (*sinks, current_usage()):
+        if isinstance(sink, Usage) and not any(sink is seen for seen in accounted):
+            accounted.append(sink)
+            sink.record(raw)
+
+
+def usage_of(streamed: Any) -> Any:
+    """The usage of an SDK run, wherever that SDK happens to keep it.
+
+    The running totals of the SDK are preferred; a build that does not keep them
+    is summed from the raw responses instead, and one that keeps neither simply
+    reports nothing rather than failing the run it was accounting.
+    """
+    running = getattr(getattr(streamed, "context_wrapper", None), "usage", None)
+    if running is not None:
+        return running
+    totals = {"requests": 0, "input_tokens": 0, "output_tokens": 0}
+    for response in getattr(streamed, "raw_responses", None) or []:
+        raw = getattr(response, "usage", None)
+        if raw is None:
+            continue
+        totals["requests"] += usage_value(raw, "requests") or 1
+        totals["input_tokens"] += usage_value(raw, "input_tokens", "prompt_tokens")
+        totals["output_tokens"] += usage_value(raw, "output_tokens", "completion_tokens")
+    return totals if totals["requests"] else None
+
+
+@dataclass(frozen=True)
+class RetryPolicy:
+    """How a model call is bounded in time and how often it is tried again.
+
+    `attempts` counts attempts in total (``1`` never retries) and `timeout`
+    bounds a single attempt (``0`` leaves it unbounded). The wait after failure
+    *n* is ``backoff * 2 ** (n - 1)`` seconds, capped at `max_backoff` and
+    multiplied by a random factor in ``[1 - jitter, 1]``, so that the clients a
+    provider failed together do not all come back at the same moment.
+    """
+
+    attempts: int = 3
+    timeout: float = 120.0
+    backoff: float = 0.5
+    max_backoff: float = 30.0
+    jitter: float = 0.5
+    transient: tuple[str, ...] = ErrorKind.TRANSIENT
+
+    @classmethod
+    def from_config(cls, config: "AgentConfig") -> "RetryPolicy":
+        """The policy a configuration describes (`request_timeout`, `retry_*`)."""
+        return cls(
+            attempts=max(1, int(config.retry_attempts)),
+            timeout=max(0.0, float(config.request_timeout)),
+            backoff=max(0.0, float(config.retry_backoff)),
+            max_backoff=max(0.0, float(config.retry_max_backoff)),
+            jitter=min(max(float(config.retry_jitter), 0.0), 1.0),
+        )
+
+    def retryable(self, kind: str, attempt: int) -> bool:
+        """True when `kind` is worth another attempt after attempt `attempt`."""
+        return attempt < self.attempts and kind in self.transient
+
+    def delay(self, attempt: int) -> float:
+        """Seconds to wait after failure `attempt` before trying again."""
+        capped = min(self.backoff * 2 ** max(attempt - 1, 0), self.max_backoff)
+        return capped * (1.0 - self.jitter * random.random())
+
+    async def call(
+        self,
+        operation: Callable[[], Awaitable[Any]],
+        *,
+        role: str = LEADER_ROLE,
+        bounded: bool = True,
+        resumable: Callable[[], bool] | None = None,
+        on_retry: Callable[[dict[str, Any]], Any] | None = None,
+    ) -> Any:
+        """Await ``operation()`` under this policy and return what it returns.
+
+        A failure is classified, tried again while it is transient and the
+        caller still considers the call `resumable`, and otherwise raised: as a
+        `ModelError` carrying the kind, or unchanged when nothing is known about
+        it, so a defect in the harness is never disguised as a provider fault.
+        Cancellation is never retried. Set `bounded` to ``False`` for a call
+        that enforces its own timeout, such as a stream read event by event.
+        """
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                if bounded and self.timeout:
+                    async with asyncio.timeout(self.timeout):
+                        return await operation()
+                return await operation()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                kind = classify_error(exc)
+                again = self.retryable(kind, attempt) and (
+                    resumable is None or resumable()
+                )
+                if not again:
+                    if kind == ErrorKind.INTERNAL:
+                        raise
+                    raise model_error(exc, kind, role=role, attempts=attempt) from exc
+                pause = self.delay(attempt)
+                usage = current_usage()
+                if usage is not None:
+                    usage.retries += 1
+                if on_retry is not None:
+                    outcome = on_retry(
+                        {
+                            "role": role,
+                            "error_kind": kind,
+                            "attempt": attempt,
+                            "attempts": self.attempts,
+                            "delay": pause,
+                            "error": str(exc),
+                        }
+                    )
+                    if inspect.isawaitable(outcome):
+                        await outcome
+                await asyncio.sleep(pause)
+
+
+# ---------------------------------------------------------------------------
 # Models
 #
 # A run may need more than one model: a leader that drives the agentic loop and
 # specialists (vision, ...) that tools delegate to. `ModelPool` keeps one client
-# per endpoint and one SDK model per model name so extra roles are cheap.
+# per endpoint and one SDK model per model name so extra roles are cheap, and
+# every request it makes itself goes through a `RetryPolicy` and is accounted.
 # ---------------------------------------------------------------------------
 
 
 class ModelPool:
     """Lazily builds and caches API clients and SDK models by `ModelSpec`."""
 
-    def __init__(self) -> None:
+    def __init__(self, policy: RetryPolicy | None = None) -> None:
         self._clients: dict[tuple[str, str], Any] = {}
         self._models: dict[tuple[str, str, str], Any] = {}
+        #: Applied to the calls the pool makes when one is not passed in.
+        self.policy = policy or RetryPolicy()
+        #: Everything this pool has spent, across runs and roles.
+        self.usage = Usage()
 
     def client(self, spec: ModelSpec) -> Any:
-        """Return the shared async client for the endpoint of `spec`."""
+        """Return the shared async client for the endpoint of `spec`.
+
+        The client is told not to retry: a retry inside the SDK is invisible to
+        the event bus, unjittered, uncounted and nested inside whatever the
+        harness is already doing, so retrying belongs to the `RetryPolicy` and
+        to it alone. The transport timeout of the pool's policy is kept, since
+        it is what stops a socket that has gone quiet mid-response.
+        """
         client = self._clients.get(spec.endpoint)
         if client is None:
             from openai import AsyncOpenAI
 
-            client = AsyncOpenAI(api_key=spec.api_key, base_url=spec.api_url)
+            options: dict[str, Any] = {"max_retries": 0}
+            if self.policy.timeout:
+                options["timeout"] = self.policy.timeout
+            client = AsyncOpenAI(
+                api_key=spec.api_key, base_url=spec.api_url, **options
+            )
             self._clients[spec.endpoint] = client
         return client
 
@@ -1458,16 +1830,40 @@ class ModelPool:
         return model
 
     async def complete(
-        self, spec: ModelSpec, messages: list[dict[str, Any]], *, max_tokens: int | None = None
+        self,
+        spec: ModelSpec,
+        messages: list[dict[str, Any]],
+        *,
+        max_tokens: int | None = None,
+        policy: RetryPolicy | None = None,
+        usage: "Usage | None" = None,
+        on_retry: Callable[[dict[str, Any]], Any] | None = None,
     ) -> str:
-        """Single chat completion against `spec`; no tools, no agentic loop."""
-        response = await self.client(spec).chat.completions.create(
-            model=spec.name, messages=messages, max_tokens=max_tokens
-        )
+        """Single chat completion against `spec`; no tools, no agentic loop.
+
+        The request is bounded and retried by `policy` (the pool's by default)
+        and what it spends is recorded on `usage`, on the run in progress and on
+        the totals of the pool. A failure that survives the policy is raised as
+        a `ModelError`, so the caller sees why it failed and not only that it
+        did.
+        """
+        resolved = policy or self.policy
+
+        async def request() -> Any:
+            return await self.client(spec).chat.completions.create(
+                model=spec.name, messages=messages, max_tokens=max_tokens
+            )
+
+        response = await resolved.call(request, role=spec.role, on_retry=on_retry)
+        self.record(getattr(response, "usage", None), usage)
         choices = getattr(response, "choices", None) or []
         if not choices:
             return ""
         return (choices[0].message.content or "").strip()
+
+    def record(self, raw: Any, usage: "Usage | None" = None) -> None:
+        """Account one provider response on the pool, the run and `usage`."""
+        record_usage(raw, self.usage, usage)
 
     async def describe_image(
         self,
@@ -1477,6 +1873,9 @@ class ModelPool:
         *,
         instructions: str = DEFAULT_VISION_INSTRUCTIONS,
         max_tokens: int | None = None,
+        policy: RetryPolicy | None = None,
+        usage: "Usage | None" = None,
+        on_retry: Callable[[dict[str, Any]], Any] | None = None,
     ) -> str:
         """Ask a vision model about one image and return its answer as text."""
         messages = [
@@ -1489,10 +1888,17 @@ class ModelPool:
                 ],
             },
         ]
-        return await self.complete(spec, messages, max_tokens=max_tokens)
+        return await self.complete(
+            spec,
+            messages,
+            max_tokens=max_tokens,
+            policy=policy,
+            usage=usage,
+            on_retry=on_retry,
+        )
 
     def clear(self) -> None:
-        """Drop every cached client and model."""
+        """Drop every cached client and model. The totals are kept."""
         self._clients.clear()
         self._models.clear()
 
@@ -1933,6 +2339,8 @@ class ConsoleRenderer:
             self.emit("tool", f"-> {event.data.get('text', 'tool')}\n")
         elif event.type == EventType.TOOL_END:
             self.emit("tool", self.tool_outcome(event.data))
+        elif event.type == EventType.MODEL_RETRY:
+            self.emit("error", self.retry_notice(event.data))
         elif event.type == EventType.AGENT_ERROR:
             self.emit("error", str(event.data.get("error", "")))
         elif event.type == EventType.AGENT_END:
@@ -1940,6 +2348,16 @@ class ConsoleRenderer:
                 self.write("\n")
             self._prev_kind = None
             self._trailing_newlines = 0
+
+    @staticmethod
+    def retry_notice(data: dict[str, Any]) -> str:
+        """The line printed when a model call is about to be tried again."""
+        role = data.get("role", LEADER_ROLE)
+        kind = data.get("error_kind", "error")
+        attempt = int(data.get("attempt", 1)) + 1
+        attempts = int(data.get("attempts", attempt))
+        delay = float(data.get("delay") or 0.0)
+        return f"!! {role} model {kind}: retry {attempt}/{attempts} in {delay:.1f}s\n"
 
     @staticmethod
     def tool_outcome(data: dict[str, Any]) -> str:
@@ -2209,10 +2627,26 @@ class RunResult:
     session_id: str | None = None
     prompt: str = ""
     error: str | None = None
+    #: One of `ErrorKind` when the run failed, so a caller can tell a rate limit
+    #: from a bad credential without reading `error`.
+    error_kind: str | None = None
+    #: Tokens and cost of every model call the run made, specialists included.
+    usage: Usage = field(default_factory=Usage)
 
     @property
     def ok(self) -> bool:
         return self.error is None
+
+    @property
+    def transient(self) -> bool:
+        """True when the run failed for a reason another run might get past."""
+        return self.error_kind in ErrorKind.TRANSIENT
+
+    def fail(self, error: str, kind: str = ErrorKind.INTERNAL) -> "RunResult":
+        """Record a failure and its kind on the result."""
+        self.error = error
+        self.error_kind = kind
+        return self
 
     def text_of(self, kind: str) -> str:
         return "".join(b.text for b in self.blocks if b.kind == kind)
@@ -2262,7 +2696,7 @@ class Engine:
         self.events = events or EventBus()
         self.prompts = prompts or PromptRenderer()
         self.tools = tools or ToolRegistry(shell=self.config.shell_enabled)
-        self.models = models or ModelPool()
+        self.models = models or ModelPool(RetryPolicy.from_config(self.config))
         #: Default directory the built-in file and shell tools are sandboxed to.
         #: Without one an embedded engine runs with no built-in tools at all.
         self.workspace = Path(workspace).expanduser().resolve() if workspace else None
@@ -2305,8 +2739,32 @@ class Engine:
             set_default_openai_client(self.models.client(spec))
         return model
 
+    def build_policy(self, config: AgentConfig) -> RetryPolicy:
+        """The policy every model call of a run is made under.
+
+        Override to bound a role differently, to widen the transient set or to
+        take the numbers from somewhere other than the configuration.
+        """
+        return RetryPolicy.from_config(config)
+
+    def retry_reporter(
+        self, session_id: str | None = None
+    ) -> Callable[[dict[str, Any]], Awaitable[None]]:
+        """A `RetryPolicy` callback that publishes `model.retry` on the bus."""
+
+        async def report(info: dict[str, Any]) -> None:
+            await self.events.publish(
+                EventType.MODEL_RETRY, session_id=session_id, **info
+            )
+
+        return report
+
     def build_vision(
-        self, config: AgentConfig
+        self,
+        config: AgentConfig,
+        *,
+        usage: "Usage | None" = None,
+        session_id: str | None = None,
     ) -> Callable[[str, str], Awaitable[str]] | None:
         """Return an image describing delegate, or ``None`` when the leader sees.
 
@@ -2317,6 +2775,8 @@ class Engine:
         spec = config.model_spec(VISION_ROLE)
         if spec is None:
             return None
+        policy = self.build_policy(config)
+        on_retry = self.retry_reporter(session_id)
 
         async def describe(data_url: str, question: str = "") -> str:
             return await self.models.describe_image(
@@ -2325,6 +2785,9 @@ class Engine:
                 question,
                 instructions=config.vision_instructions,
                 max_tokens=config.vision_max_tokens or None,
+                policy=policy,
+                usage=usage,
+                on_retry=on_retry,
             )
 
         return describe
@@ -2334,11 +2797,13 @@ class Engine:
         workspace: Workspace,
         config: AgentConfig | None = None,
         checkout: "Checkout | None" = None,
+        *,
+        usage: "Usage | None" = None,
+        session_id: str | None = None,
     ) -> list[Any]:
         resolved = config or self.config
-        return self.tools.build(
-            workspace, vision=self.build_vision(resolved), checkout=checkout
-        )
+        vision = self.build_vision(resolved, usage=usage, session_id=session_id)
+        return self.tools.build(workspace, vision=vision, checkout=checkout)
 
     def build_sdk_agent(self, config: AgentConfig, tools: list[Any]) -> Any:
         from agents import Agent as SdkAgent
@@ -2398,29 +2863,46 @@ class Engine:
     async def running(
         self, config: AgentConfig, result: RunResult
     ) -> AsyncIterator[RunResult]:
-        """Publish the lifecycle events of a run and trap its failures."""
+        """Publish the lifecycle events of a run, trap and classify its failures.
+
+        The accounting of the result is published as well: while the body runs
+        it is the sink every model call underneath finds, and `agent.end` always
+        carries the tokens it collected, priced when the configuration says what
+        a token costs.
+        """
+        token = _USAGE.set(result.usage)
         await self.events.publish(
             EventType.AGENT_START, session_id=result.session_id, config=config
         )
         try:
             yield result
         except asyncio.CancelledError:
-            result.error = "cancelled"
+            result.fail("cancelled", ErrorKind.CANCELLED)
             await self.events.publish(
-                EventType.AGENT_ERROR, session_id=result.session_id, error="cancelled"
+                EventType.AGENT_ERROR,
+                session_id=result.session_id,
+                error=result.error,
+                error_kind=result.error_kind,
             )
             raise
         except Exception as exc:
-            result.error = str(exc)
+            result.fail(str(exc) or type(exc).__name__, classify_error(exc))
             await self.events.publish(
-                EventType.AGENT_ERROR, session_id=result.session_id, error=str(exc)
+                EventType.AGENT_ERROR,
+                session_id=result.session_id,
+                error=result.error,
+                error_kind=result.error_kind,
             )
         finally:
+            result.usage.price(config.cost_input, config.cost_output)
+            _USAGE.reset(token)
             await self.events.publish(
                 EventType.AGENT_END,
                 session_id=result.session_id,
                 output=result.output,
                 error=result.error,
+                error_kind=result.error_kind,
+                usage=result.usage.to_dict(),
                 config=config,
             )
 
@@ -2434,12 +2916,34 @@ class Engine:
         workspace: "Workspace | Path | str | None" = None,
         checkout: "Checkout | None" = None,
     ) -> RunResult:
-        """One pass of the loop: build the tools, the model and stream it."""
+        """One pass of the loop: build the tools, the model and stream it.
+
+        The stream runs under the retry policy of the run, but only while it has
+        produced nothing: once a block or a tool call exists, a second attempt
+        would replay work the consumer has already seen, so a failure after that
+        point is reported instead.
+        """
         sandbox = self.build_workspace(workspace, config)
         if tools is None:
-            tools = self.build_tools(sandbox, config, checkout) if sandbox else []
+            tools = (
+                self.build_tools(
+                    sandbox,
+                    config,
+                    checkout,
+                    usage=result.usage,
+                    session_id=result.session_id,
+                )
+                if sandbox
+                else []
+            )
         sdk_agent = self.build_sdk_agent(config, tools)
-        return await self.stream(sdk_agent, model_input, config, result)
+        return await self.build_policy(config).call(
+            lambda: self.stream(sdk_agent, model_input, config, result),
+            role=LEADER_ROLE,
+            bounded=False,
+            resumable=lambda: not (result.blocks or result.tools),
+            on_retry=self.retry_reporter(result.session_id),
+        )
 
     async def stream(
         self,
@@ -2451,11 +2955,15 @@ class Engine:
         """Consume the SDK event stream, publishing block events as it goes.
 
         `model_input` is the prompt on its own, or a replayed transcript with
-        the prompt as its newest message.
+        the prompt as its newest message. The read is bounded by a stall guard:
+        a provider that stops sending for longer than the budget of the run ends
+        the attempt with `ErrorKind.TIMEOUT` instead of hanging the caller, and
+        whatever the attempt spent is accounted even when it failed.
         """
         from agents import RawResponsesStreamEvent, RunItemStreamEvent, Runner
 
         session_id = result.session_id
+        policy = self.build_policy(config)
         streamed = Runner.run_streamed(
             starting_agent=sdk_agent, input=model_input, max_turns=config.max_turns
         )
@@ -2534,40 +3042,90 @@ class Engine:
                 text=call.report(),
             )
 
-        async for event in streamed.stream_events():
-            if isinstance(event, RunItemStreamEvent):
-                if event.name == "tool_called":
-                    await begin_tool(event.item)
-                elif event.name == "tool_output":
-                    await finish_tool(event.item)
-                continue
-            if not isinstance(event, RawResponsesStreamEvent):
-                continue
-            data = event.data
-            kind = self.DELTA_KINDS.get(getattr(data, "type", ""))
-            if kind is not None:
-                delta = getattr(data, "delta", "") or ""
-                if not delta:
+        events = streamed.stream_events().__aiter__()
+        try:
+            while True:
+                waiting = any(not call.done for call in result.tools)
+                try:
+                    event = await self.next_event(
+                        events, self.stall_timeout(policy, config, waiting)
+                    )
+                except StopAsyncIteration:
+                    break
+                if isinstance(event, RunItemStreamEvent):
+                    if event.name == "tool_called":
+                        await begin_tool(event.item)
+                    elif event.name == "tool_output":
+                        await finish_tool(event.item)
                     continue
-                if current is None or current.kind != kind:
+                if not isinstance(event, RawResponsesStreamEvent):
+                    continue
+                data = event.data
+                kind = self.DELTA_KINDS.get(getattr(data, "type", ""))
+                if kind is not None:
+                    delta = getattr(data, "delta", "") or ""
+                    if not delta:
+                        continue
+                    if current is None or current.kind != kind:
+                        await close_block(current)
+                        current = await open_block(kind)
+                    current.text += delta
+                    await self.events.publish(
+                        EventType.BLOCK_DELTA,
+                        session_id=session_id,
+                        id=current.id,
+                        kind=kind,
+                        text=delta,
+                    )
+                elif getattr(data, "type", "") == "response.function_call_arguments.delta":
+                    # The call itself is published from the run item event; here
+                    # the only job is to end the block the model was writing.
                     await close_block(current)
-                    current = await open_block(kind)
-                current.text += delta
-                await self.events.publish(
-                    EventType.BLOCK_DELTA,
-                    session_id=session_id,
-                    id=current.id,
-                    kind=kind,
-                    text=delta,
-                )
-            elif getattr(data, "type", "") == "response.function_call_arguments.delta":
-                # The call itself is published from the run item event; here the
-                # only job is to end the block the model was writing.
-                await close_block(current)
-                current = None
+                    current = None
+        except BaseException:
+            self.cancel_stream(streamed)
+            raise
+        finally:
+            self.models.record(usage_of(streamed), result.usage)
         await close_block(current)
         result.output = streamed.final_output or result.text_of("output")
         return result
+
+    def stall_timeout(
+        self, policy: RetryPolicy, config: AgentConfig, waiting: bool = False
+    ) -> float:
+        """How long the leader may say nothing before the attempt is failed.
+
+        The SDK runs tool calls inside the stream, so while one is still
+        outstanding the budget is extended by the time a tool is allowed to
+        take; otherwise a slow shell command would be indistinguishable from a
+        stalled provider.
+        """
+        if not policy.timeout:
+            return 0.0
+        return policy.timeout + config.shell_timeout if waiting else policy.timeout
+
+    async def next_event(self, events: Any, timeout: float = 0.0) -> Any:
+        """The next event of an SDK stream, bounded by a stall `timeout`."""
+        if not timeout:
+            return await events.__anext__()
+        try:
+            async with asyncio.timeout(timeout):
+                return await events.__anext__()
+        except TimeoutError as exc:
+            raise ModelError(
+                f"the model sent nothing for {timeout:g}s",
+                ErrorKind.TIMEOUT,
+                role=LEADER_ROLE,
+            ) from exc
+
+    @staticmethod
+    def cancel_stream(streamed: Any) -> None:
+        """Stop an SDK stream that will not be read any further."""
+        cancel = getattr(streamed, "cancel", None)
+        if callable(cancel):
+            with contextlib.suppress(Exception):
+                cancel()
 
     # -- tool call transparency ---------------------------------------------
 
@@ -2744,6 +3302,8 @@ class Agent(Engine):
         if spec is None:
             return None
 
+        policy = self.build_policy(config)
+
         async def summarize(turns: list[Turn]) -> str:
             transcript = "\n\n".join(f"{t.role}: {t.text}" for t in turns)
             return await self.models.complete(
@@ -2753,6 +3313,8 @@ class Agent(Engine):
                     {"role": "user", "content": transcript},
                 ],
                 max_tokens=config.summary_max_tokens or None,
+                policy=policy,
+                on_retry=self.retry_reporter(),
             )
 
         return summarize
