@@ -1994,9 +1994,11 @@ class ModelPool:
             options: dict[str, Any] = {"max_retries": 0}
             if self.policy.timeout:
                 options["timeout"] = self.policy.timeout
-            client = AsyncOpenAI(
-                api_key=spec.api_key, base_url=spec.api_url, **options
-            )
+            # An empty key means "no key here": pass nothing so the SDK falls
+            # back to its own environment lookups (OPENAI_API_KEY, ...).
+            if spec.api_key:
+                options["api_key"] = spec.api_key
+            client = AsyncOpenAI(base_url=spec.api_url, **options)
             self._clients[spec.endpoint] = client
         return client
 

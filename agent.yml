@@ -1,0 +1,5 @@
+# agent.yml — default configuration for the `Agent` harness.
+
+api_url: http://127.0.0.1:11434/v1
+
+model: huihui_ai/Qwen3.8-abliterated:27b

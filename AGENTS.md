@@ -22,6 +22,8 @@
 
 ## Environment
 
+- Always use setup.sh/setup.ps1 to install missing resources
+
 ### File Descriptions
 
 - setup.ps1: install required environment tools (Windows)
