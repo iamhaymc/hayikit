@@ -147,6 +147,522 @@ class ModelPoolTest(unittest.TestCase):
         self.assertIsNot(first, self.pool.client(spec))
 
 
+class RateLimitError(Exception):
+    """Named the way a provider SDK names it, which is how it is classified."""
+
+
+class BadRequestError(Exception):
+    pass
+
+
+class Status(Exception):
+    """An error that only says what the transport said: a status code."""
+
+    def __init__(self, status):
+        super().__init__(f"HTTP {status}")
+        self.response = type("Response", (), {"status_code": status})()
+
+
+def no_sleep():
+    """Patch `asyncio.sleep` and collect the delays a retry would have waited."""
+    delays: list[float] = []
+
+    async def sleep(seconds):
+        delays.append(seconds)
+
+    return unittest.mock.patch("asyncio.sleep", sleep), delays
+
+
+class ErrorTaxonomyTest(unittest.TestCase):
+    """Every failure of a run is reported as one of a handful of kinds."""
+
+    def test_provider_errors_classify_by_class_name(self):
+        self.assertEqual(A.classify_error(RateLimitError("slow down")), "rate_limit")
+        self.assertEqual(A.classify_error(BadRequestError("nope")), "invalid_request")
+
+    def test_builtin_failures_classify(self):
+        self.assertEqual(A.classify_error(TimeoutError()), "timeout")
+        self.assertEqual(A.classify_error(ConnectionError()), "connection")
+        self.assertEqual(A.classify_error(OSError("socket")), "connection")
+        self.assertEqual(A.classify_error(asyncio.CancelledError()), "cancelled")
+
+    def test_unknown_failures_are_internal(self):
+        self.assertEqual(A.classify_error(ValueError("boom")), "internal")
+
+    def test_a_status_code_classifies_an_unknown_class(self):
+        self.assertEqual(A.classify_error(Status(429)), "rate_limit")
+        self.assertEqual(A.classify_error(Status(503)), "server")
+        self.assertEqual(A.classify_error(Status(504)), "timeout")
+        self.assertEqual(A.classify_error(Status(401)), "auth")
+        self.assertEqual(A.classify_error(Status(422)), "invalid_request")
+
+    def test_a_model_error_keeps_its_kind(self):
+        error = A.ModelError("stalled", A.ErrorKind.TIMEOUT, role="vision")
+        self.assertEqual(A.classify_error(error), "timeout")
+        self.assertEqual(error.role, "vision")
+
+    def test_only_some_kinds_are_worth_another_attempt(self):
+        self.assertIn(A.ErrorKind.RATE_LIMIT, A.ErrorKind.TRANSIENT)
+        self.assertIn(A.ErrorKind.SERVER, A.ErrorKind.TRANSIENT)
+        self.assertNotIn(A.ErrorKind.AUTH, A.ErrorKind.TRANSIENT)
+        self.assertNotIn(A.ErrorKind.INTERNAL, A.ErrorKind.TRANSIENT)
+
+
+class RetryPolicyTest(unittest.TestCase):
+    """One timeout per attempt, bounded retries, exponential backoff, jitter."""
+
+    def test_from_config_reads_the_settings(self):
+        config = A.AgentConfig(
+            request_timeout=5.0, retry_attempts=4, retry_backoff=2.0, retry_jitter=2.0
+        )
+        policy = A.RetryPolicy.from_config(config)
+        self.assertEqual(policy.timeout, 5.0)
+        self.assertEqual(policy.attempts, 4)
+        self.assertEqual(policy.backoff, 2.0)
+        self.assertEqual(policy.jitter, 1.0)
+
+    def test_backoff_grows_is_capped_and_is_jittered(self):
+        policy = A.RetryPolicy(backoff=1.0, max_backoff=4.0, jitter=0.5)
+        for attempt, ceiling in ((1, 1.0), (2, 2.0), (3, 4.0), (9, 4.0)):
+            delay = policy.delay(attempt)
+            self.assertGreaterEqual(delay, ceiling * 0.5)
+            self.assertLessEqual(delay, ceiling)
+
+    def test_no_jitter_is_plain_exponential_backoff(self):
+        policy = A.RetryPolicy(backoff=0.25, max_backoff=10.0, jitter=0.0)
+        self.assertEqual([policy.delay(n) for n in (1, 2, 3)], [0.25, 0.5, 1.0])
+
+    def test_a_successful_call_is_made_once(self):
+        calls = []
+
+        async def operation():
+            calls.append(1)
+            return "ok"
+
+        policy = A.RetryPolicy(attempts=3, timeout=0)
+        self.assertEqual(run(policy.call(operation)), "ok")
+        self.assertEqual(len(calls), 1)
+
+    def test_a_transient_failure_is_tried_again(self):
+        errors = [Status(503), RateLimitError("slow down")]
+
+        async def operation():
+            if errors:
+                raise errors.pop(0)
+            return "ok"
+
+        patch, delays = no_sleep()
+        policy = A.RetryPolicy(attempts=3, timeout=0, backoff=1.0, jitter=0.0)
+        with patch:
+            self.assertEqual(run(policy.call(operation)), "ok")
+        self.assertEqual(delays, [1.0, 2.0])
+
+    def test_retries_are_bounded_and_end_as_a_model_error(self):
+        async def operation():
+            raise RateLimitError("slow down")
+
+        patch, delays = no_sleep()
+        policy = A.RetryPolicy(attempts=3, timeout=0, backoff=0.0)
+        with patch, self.assertRaises(A.ModelError) as caught:
+            run(policy.call(operation, role="vision"))
+        self.assertEqual(caught.exception.kind, "rate_limit")
+        self.assertEqual(caught.exception.attempts, 3)
+        self.assertEqual(caught.exception.role, "vision")
+        self.assertIn("slow down", str(caught.exception))
+        self.assertEqual(len(delays), 2)
+
+    def test_a_refusal_is_reported_without_a_second_attempt(self):
+        calls = []
+
+        async def operation():
+            calls.append(1)
+            raise Status(401)
+
+        policy = A.RetryPolicy(attempts=3, timeout=0, backoff=0.0)
+        with self.assertRaises(A.ModelError) as caught:
+            run(policy.call(operation))
+        self.assertEqual(caught.exception.kind, "auth")
+        self.assertEqual(len(calls), 1)
+
+    def test_an_unknown_failure_is_raised_unchanged(self):
+        async def operation():
+            raise ValueError("boom")
+
+        policy = A.RetryPolicy(attempts=3, timeout=0, backoff=0.0)
+        with self.assertRaises(ValueError) as caught:
+            run(policy.call(operation))
+        self.assertEqual(str(caught.exception), "boom")
+
+    def test_an_attempt_is_bounded_by_the_timeout(self):
+        async def operation():
+            await asyncio.Event().wait()
+
+        policy = A.RetryPolicy(attempts=1, timeout=0.01)
+        with self.assertRaises(A.ModelError) as caught:
+            run(policy.call(operation))
+        self.assertEqual(caught.exception.kind, "timeout")
+
+    def test_an_unbounded_call_is_left_to_time_itself_out(self):
+        async def operation():
+            await asyncio.sleep(0)
+            return "ok"
+
+        policy = A.RetryPolicy(attempts=1, timeout=0.01)
+        self.assertEqual(run(policy.call(operation, bounded=False)), "ok")
+
+    def test_a_call_that_cannot_be_resumed_is_not_tried_again(self):
+        calls = []
+
+        async def operation():
+            calls.append(1)
+            raise Status(503)
+
+        policy = A.RetryPolicy(attempts=3, timeout=0, backoff=0.0)
+        with self.assertRaises(A.ModelError):
+            run(policy.call(operation, resumable=lambda: False))
+        self.assertEqual(len(calls), 1)
+
+    def test_cancellation_is_never_retried(self):
+        calls = []
+
+        async def operation():
+            calls.append(1)
+            raise asyncio.CancelledError()
+
+        policy = A.RetryPolicy(attempts=3, timeout=0, backoff=0.0)
+        with self.assertRaises(asyncio.CancelledError):
+            run(policy.call(operation))
+        self.assertEqual(len(calls), 1)
+
+    def test_every_retry_is_reported(self):
+        errors = [Status(503)]
+        seen: list[dict] = []
+
+        async def operation():
+            if errors:
+                raise errors.pop(0)
+            return "ok"
+
+        async def on_retry(info):
+            seen.append(info)
+
+        patch, _ = no_sleep()
+        policy = A.RetryPolicy(attempts=2, timeout=0, backoff=0.0)
+        with patch:
+            run(policy.call(operation, role="leader", on_retry=on_retry))
+        self.assertEqual(seen[0]["error_kind"], "server")
+        self.assertEqual(seen[0]["attempt"], 1)
+        self.assertEqual(seen[0]["attempts"], 2)
+        self.assertEqual(seen[0]["role"], "leader")
+
+
+class UsageTest(unittest.TestCase):
+    """Tokens are counted wherever they are spent and priced at the end."""
+
+    def test_either_naming_is_recorded(self):
+        usage = A.Usage()
+        usage.record({"prompt_tokens": 10, "completion_tokens": 4})
+        usage.record(types.SimpleNamespace(input_tokens=5, output_tokens=1, requests=2))
+        self.assertEqual(usage.requests, 3)
+        self.assertEqual(usage.input_tokens, 15)
+        self.assertEqual(usage.output_tokens, 5)
+        self.assertEqual(usage.total_tokens, 20)
+
+    def test_nothing_is_recorded_without_a_payload(self):
+        self.assertEqual(A.Usage().record(None).requests, 0)
+
+    def test_tokens_are_priced_per_million(self):
+        usage = A.Usage(input_tokens=1_000_000, output_tokens=500_000)
+        self.assertAlmostEqual(usage.price(3.0, 15.0), 10.5)
+        self.assertAlmostEqual(usage.to_dict()["cost"], 10.5)
+
+    def test_an_unpriced_run_still_reports_its_tokens(self):
+        usage = A.Usage(input_tokens=7)
+        usage.price()
+        self.assertEqual(usage.to_dict()["cost"], 0.0)
+        self.assertEqual(usage.to_dict()["input_tokens"], 7)
+
+    def test_a_payload_is_never_counted_twice_on_one_sink(self):
+        sink = A.Usage()
+        A.record_usage({"prompt_tokens": 3}, sink, sink)
+        self.assertEqual(sink.input_tokens, 3)
+        self.assertEqual(sink.requests, 1)
+
+    def test_usage_of_prefers_the_running_totals_of_the_sdk(self):
+        streamed = types.SimpleNamespace(
+            context_wrapper=types.SimpleNamespace(usage="totals"), raw_responses=[]
+        )
+        self.assertEqual(A.usage_of(streamed), "totals")
+
+    def test_usage_of_falls_back_to_the_raw_responses(self):
+        streamed = types.SimpleNamespace(
+            context_wrapper=None,
+            raw_responses=[
+                types.SimpleNamespace(usage={"input_tokens": 2, "output_tokens": 1}),
+                types.SimpleNamespace(usage={"prompt_tokens": 3, "completion_tokens": 4}),
+            ],
+        )
+        self.assertEqual(
+            A.usage_of(streamed),
+            {"requests": 2, "input_tokens": 5, "output_tokens": 5},
+        )
+
+    def test_usage_of_reports_nothing_when_the_sdk_keeps_nothing(self):
+        self.assertIsNone(A.usage_of(types.SimpleNamespace()))
+
+
+class ModelPoolResilienceTest(unittest.TestCase):
+    """Specialist calls are bounded, retried and accounted like the leader."""
+
+    class FailingClient:
+        def __init__(self, errors=(), usage=None):
+            self.errors = list(errors)
+            self.usage = usage
+            self.calls = []
+            self.chat = self
+
+        @property
+        def completions(self):
+            return self
+
+        async def create(self, **kwargs):
+            self.calls.append(kwargs)
+            if self.errors:
+                raise self.errors.pop(0)
+            message = type("M", (), {"content": "done"})()
+            return type(
+                "R",
+                (),
+                {"choices": [type("C", (), {"message": message})()], "usage": self.usage},
+            )()
+
+    def pool(self, client, **policy):
+        pool = A.ModelPool(A.RetryPolicy(timeout=0, backoff=0.0, **policy))
+        pool._clients[("http://url", "k")] = client
+        return pool
+
+    def test_a_transient_failure_is_tried_again(self):
+        client = self.FailingClient(errors=[Status(503)])
+        pool = self.pool(client, attempts=2)
+        spec = A.ModelSpec("vision", "v", "http://url", "k")
+        patch, _ = no_sleep()
+        with patch:
+            answer = run(pool.complete(spec, [{"role": "user", "content": "hi"}]))
+        self.assertEqual(answer, "done")
+        self.assertEqual(len(client.calls), 2)
+
+    def test_an_exhausted_call_reports_the_role_and_the_kind(self):
+        client = self.FailingClient(errors=[Status(503), Status(503)])
+        pool = self.pool(client, attempts=2)
+        spec = A.ModelSpec("vision", "v", "http://url", "k")
+        patch, _ = no_sleep()
+        with patch, self.assertRaises(A.ModelError) as caught:
+            run(pool.complete(spec, []))
+        self.assertEqual(caught.exception.kind, "server")
+        self.assertEqual(caught.exception.role, "vision")
+
+    def test_tokens_are_recorded_on_the_pool_and_the_caller(self):
+        client = self.FailingClient(usage={"prompt_tokens": 9, "completion_tokens": 3})
+        pool = self.pool(client, attempts=1)
+        spec = A.ModelSpec("vision", "v", "http://url", "k")
+        sink = A.Usage()
+        run(pool.complete(spec, [], usage=sink))
+        self.assertEqual(sink.input_tokens, 9)
+        self.assertEqual(sink.output_tokens, 3)
+        self.assertEqual(pool.usage.input_tokens, 9)
+        self.assertEqual(pool.usage.requests, 1)
+
+    def test_the_sdk_is_not_allowed_to_retry_behind_the_policy(self):
+        pool = A.ModelPool(A.RetryPolicy(timeout=42.0))
+        client = pool.client(A.ModelSpec("leader", "m", "http://url", "k"))
+        self.assertEqual(client.max_retries, 0)
+        self.assertEqual(client.timeout, 42.0)
+
+    def test_an_unbounded_policy_leaves_the_transport_alone(self):
+        pool = A.ModelPool(A.RetryPolicy(timeout=0))
+        client = pool.client(A.ModelSpec("leader", "m", "http://url", "k"))
+        self.assertEqual(client.max_retries, 0)
+        self.assertNotEqual(client.timeout, 0)
+
+    def test_the_totals_survive_a_clear(self):
+        client = self.FailingClient(usage={"prompt_tokens": 2})
+        pool = self.pool(client, attempts=1)
+        run(pool.complete(A.ModelSpec("vision", "v", "http://url", "k"), []))
+        pool.clear()
+        self.assertEqual(pool.usage.input_tokens, 2)
+
+
+class EngineResilienceTest(unittest.TestCase):
+    """A run bounds its model calls, classifies what failed and prices it."""
+
+    class RetryEngine(A.Engine):
+        """An engine whose stream fails a given number of times first."""
+
+        errors: list = []
+        partial: bool = False
+
+        def build_sdk_agent(self, config, tools):
+            return {}
+
+        async def stream(self, sdk_agent, model_input, config, result):
+            self.attempts = getattr(self, "attempts", 0) + 1
+            if self.partial:
+                result.blocks.append(A.Block(id="b0", kind="output"))
+            if self.errors:
+                raise self.errors.pop(0)
+            result.usage.record({"prompt_tokens": 100, "completion_tokens": 10})
+            result.output = "ok"
+            return result
+
+    def engine(self, errors=(), partial=False, **overrides):
+        engine = self.RetryEngine(
+            env=False, retry_backoff=0.0, request_timeout=0, **overrides
+        )
+        engine.errors = list(errors)
+        engine.partial = partial
+        self.addCleanup(engine.close)
+        return engine
+
+    def test_a_stalled_leader_is_tried_again_before_anything_is_shown(self):
+        engine = self.engine(errors=[Status(503)])
+        patch, _ = no_sleep()
+        with patch:
+            result = run(engine.run("hello"))
+        self.assertTrue(result.ok)
+        self.assertEqual(engine.attempts, 2)
+
+    def test_a_stream_that_already_produced_output_is_not_replayed(self):
+        engine = self.engine(errors=[Status(503)], partial=True)
+        result = run(engine.run("hello"))
+        self.assertFalse(result.ok)
+        self.assertEqual(engine.attempts, 1)
+        self.assertEqual(result.error_kind, "server")
+
+    def test_a_failure_carries_its_kind(self):
+        engine = self.engine(errors=[Status(401)])
+        result = run(engine.run("hello"))
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error_kind, "auth")
+        self.assertFalse(result.transient)
+        self.assertIn("auth", result.error)
+
+    def test_an_exhausted_retry_is_reported_as_transient(self):
+        engine = self.engine(errors=[Status(503), Status(503), Status(503)])
+        patch, _ = no_sleep()
+        with patch:
+            result = run(engine.run("hello"))
+        self.assertEqual(result.error_kind, "server")
+        self.assertTrue(result.transient)
+        self.assertEqual(engine.attempts, 3)
+
+    def test_a_defect_in_the_harness_is_not_disguised_as_a_provider_fault(self):
+        engine = self.engine(errors=[ValueError("boom")])
+        result = run(engine.run("hello"))
+        self.assertEqual(result.error, "boom")
+        self.assertEqual(result.error_kind, "internal")
+        self.assertEqual(engine.attempts, 1)
+
+    def test_every_retry_is_published(self):
+        engine = self.engine(errors=[Status(503)])
+        seen: list[A.Event] = []
+        engine.events.on(A.EventType.MODEL_RETRY, seen.append)
+        patch, _ = no_sleep()
+        with patch:
+            run(engine.run("hello"))
+        self.assertEqual(seen[0].data["error_kind"], "server")
+        self.assertEqual(seen[0].data["role"], A.LEADER_ROLE)
+
+    def test_a_retry_is_counted_against_the_run(self):
+        engine = self.engine(errors=[Status(503)])
+        patch, _ = no_sleep()
+        with patch:
+            result = run(engine.run("hello"))
+        self.assertEqual(result.usage.retries, 1)
+
+    def test_the_end_of_a_run_carries_its_tokens_and_its_cost(self):
+        engine = self.engine(cost_input=3.0, cost_output=15.0)
+        ended: list[dict] = []
+        engine.events.on(A.EventType.AGENT_END, lambda e: ended.append(e.data))
+        result = run(engine.run("hello"))
+        self.assertEqual(result.usage.total_tokens, 110)
+        self.assertAlmostEqual(result.usage.cost, 100 * 3.0 / 1e6 + 10 * 15.0 / 1e6)
+        self.assertEqual(ended[0]["usage"]["total_tokens"], 110)
+        self.assertAlmostEqual(ended[0]["usage"]["cost"], result.usage.cost)
+        self.assertIsNone(ended[0]["error_kind"])
+
+    def test_a_specialist_called_by_a_tool_is_accounted_on_the_run(self):
+        class Accounting(self.RetryEngine):
+            async def stream(self, sdk_agent, model_input, config, result):
+                usage = A.current_usage()
+                usage.record({"prompt_tokens": 40, "completion_tokens": 2})
+                result.output = "ok"
+                return result
+
+        engine = Accounting(env=False)
+        self.addCleanup(engine.close)
+        result = run(engine.run("hello"))
+        self.assertEqual(result.usage.input_tokens, 40)
+
+    def test_cancellation_is_reported_as_cancellation(self):
+        class Stuck(self.RetryEngine):
+            async def stream(self, sdk_agent, model_input, config, result):
+                raise asyncio.CancelledError()
+
+        engine = Stuck(env=False)
+        self.addCleanup(engine.close)
+        with self.assertRaises(asyncio.CancelledError):
+            run(engine.run("hello"))
+
+
+class StallGuardTest(unittest.TestCase):
+    """The leader may go quiet, but not for longer than the run allows."""
+
+    def setUp(self):
+        self.engine = A.Engine(env=False)
+        self.addCleanup(self.engine.close)
+
+    async def stream_of(self, *events, delay=0.0):
+        for event in events:
+            if delay:
+                await asyncio.sleep(delay)
+            yield event
+
+    def test_an_event_arrives_within_the_budget(self):
+        events = self.stream_of("first", "second").__aiter__()
+        self.assertEqual(run(self.engine.next_event(events, 1.0)), "first")
+
+    def test_a_silent_provider_fails_the_attempt(self):
+        events = self.stream_of("late", delay=5.0).__aiter__()
+        with self.assertRaises(A.ModelError) as caught:
+            run(self.engine.next_event(events, 0.01))
+        self.assertEqual(caught.exception.kind, "timeout")
+        self.assertEqual(caught.exception.role, A.LEADER_ROLE)
+
+    def test_the_end_of_a_stream_is_not_a_failure(self):
+        events = self.stream_of().__aiter__()
+        with self.assertRaises(StopAsyncIteration):
+            run(self.engine.next_event(events, 1.0))
+
+    def test_a_budget_of_zero_waits_forever(self):
+        events = self.stream_of("first").__aiter__()
+        self.assertEqual(run(self.engine.next_event(events, 0.0)), "first")
+
+    def test_a_running_tool_extends_the_budget(self):
+        policy = A.RetryPolicy(timeout=30.0)
+        config = A.AgentConfig(shell_timeout=120)
+        self.assertEqual(self.engine.stall_timeout(policy, config, False), 30.0)
+        self.assertEqual(self.engine.stall_timeout(policy, config, True), 150.0)
+
+    def test_an_unbounded_policy_never_stalls(self):
+        policy = A.RetryPolicy(timeout=0.0)
+        self.assertEqual(self.engine.stall_timeout(policy, A.AgentConfig(), True), 0.0)
+
+    def test_an_abandoned_stream_is_cancelled(self):
+        calls = []
+        A.Engine.cancel_stream(types.SimpleNamespace(cancel=lambda: calls.append(1)))
+        A.Engine.cancel_stream(types.SimpleNamespace())
+        self.assertEqual(calls, [1])
+
 class InputResolutionTest(unittest.TestCase):
     def test_raw_text_is_returned_as_is(self):
         self.assertEqual(A.resolve_input("just text"), "just text")
@@ -1074,6 +1590,129 @@ class EngineTest(unittest.TestCase):
         self.assertTrue(issubclass(A.Agent, A.Engine))
 
 
+class StreamTest(unittest.TestCase):
+    """The block stream itself, driven by a scripted SDK run."""
+
+    class FakeStream:
+        """What `Runner.run_streamed` returns: events, then an optional stall."""
+
+        def __init__(self, events=(), final_output="", usage=None, stall=0.0):
+            self.events = list(events)
+            self.final_output = final_output
+            self.context_wrapper = types.SimpleNamespace(usage=usage)
+            self.raw_responses = []
+            self.cancelled = False
+            self.stall = stall
+
+        def cancel(self):
+            self.cancelled = True
+
+        async def stream_events(self):
+            for event in self.events:
+                yield event
+            if self.stall:
+                await asyncio.sleep(self.stall)
+
+    @staticmethod
+    def delta(text, kind="response.output_text.delta"):
+        from agents import RawResponsesStreamEvent
+
+        return RawResponsesStreamEvent(
+            data=types.SimpleNamespace(type=kind, delta=text)
+        )
+
+    @staticmethod
+    def item(name, item):
+        from agents import RunItemStreamEvent
+
+        return RunItemStreamEvent(name=name, item=item)
+
+    def drive(self, streamed, **overrides):
+        """An engine, the result it will fill and a call that streams `streamed`."""
+        import agents
+
+        engine = A.Engine(env=False, **overrides)
+        self.addCleanup(engine.close)
+        config = engine.resolve_config()
+        result = A.RunResult(session_id="s1")
+
+        def stream():
+            with unittest.mock.patch.object(
+                agents.Runner, "run_streamed", lambda **_: streamed
+            ):
+                return run(engine.stream({}, "hello", config, result))
+
+        return engine, result, stream
+
+    def test_deltas_become_blocks_and_events(self):
+        streamed = self.FakeStream(
+            events=[
+                self.delta("thinking", "response.reasoning_text.delta"),
+                self.delta("hel"),
+                self.delta("lo"),
+            ],
+            usage={"prompt_tokens": 12, "completion_tokens": 3},
+        )
+        engine, result, stream = self.drive(streamed)
+        seen: list[str] = []
+        engine.events.on(A.EventType.ALL, lambda e: seen.append(e.type))
+        stream()
+        self.assertEqual(result.output, "hello")
+        self.assertEqual(result.text_of("reasoning"), "thinking")
+        self.assertEqual([b.kind for b in result.blocks], ["reasoning", "output"])
+        self.assertEqual(seen.count("block.start"), 2)
+        self.assertEqual(seen.count("block.end"), 2)
+        self.assertEqual(result.usage.input_tokens, 12)
+        self.assertEqual(engine.models.usage.output_tokens, 3)
+
+    def test_tool_calls_open_and_close_a_tool_block(self):
+        call = types.SimpleNamespace(
+            tool_name="read_text_file",
+            raw_item=types.SimpleNamespace(call_id="c1", arguments='{"path": "a.txt"}'),
+        )
+        output = types.SimpleNamespace(output="contents", call_id="c1")
+        streamed = self.FakeStream(
+            events=[
+                self.item("tool_called", call),
+                self.item("tool_output", output),
+                self.delta("done"),
+            ],
+            final_output="done",
+        )
+        _engine, result, stream = self.drive(streamed)
+        stream()
+        self.assertEqual([t.name for t in result.tools], ["read_text_file"])
+        self.assertTrue(result.tools[0].done)
+        self.assertEqual(result.tools[0].result, "contents")
+        self.assertEqual(result.output, "done")
+
+    def test_a_stalled_stream_fails_the_attempt_and_is_cancelled(self):
+        streamed = self.FakeStream(stall=5.0)
+        _engine, _result, stream = self.drive(streamed, request_timeout=0.01)
+        with self.assertRaises(A.ModelError) as caught:
+            stream()
+        self.assertEqual(caught.exception.kind, "timeout")
+        self.assertTrue(streamed.cancelled)
+
+    def test_what_a_failed_attempt_spent_is_still_accounted(self):
+        streamed = self.FakeStream(
+            events=[self.delta("partial")],
+            usage={"prompt_tokens": 8},
+            stall=5.0,
+        )
+        _engine, result, stream = self.drive(streamed, request_timeout=0.01)
+        with self.assertRaises(A.ModelError):
+            stream()
+        self.assertEqual(result.usage.input_tokens, 8)
+
+    def test_a_run_survives_an_sdk_that_reports_no_usage(self):
+        streamed = self.FakeStream(events=[self.delta("hi")])
+        _engine, result, stream = self.drive(streamed)
+        stream()
+        self.assertEqual(result.output, "hi")
+        self.assertEqual(result.usage.requests, 0)
+
+
 class ToolCallTest(unittest.TestCase):
     """Tool calls are published with their name, arguments, outcome and time."""
 
@@ -1362,6 +2001,23 @@ class ConsoleRendererTest(unittest.TestCase):
     def test_empty_text_is_ignored(self):
         self.renderer.emit("output", "")
         self.assertEqual(self.buffer.text, "")
+
+    def test_a_retry_is_announced(self):
+        self.renderer.handle(
+            A.Event(
+                type=A.EventType.MODEL_RETRY,
+                data={
+                    "role": "leader",
+                    "error_kind": "rate_limit",
+                    "attempt": 1,
+                    "attempts": 3,
+                    "delay": 0.75,
+                },
+            )
+        )
+        self.assertEqual(
+            self.buffer.text, "!! leader model rate_limit: retry 2/3 in 0.8s\n"
+        )
 
     def test_color_styles_are_applied_when_enabled(self):
         renderer = A.ConsoleRenderer(color=True, stream=self.Buffer())

@@ -22,8 +22,8 @@ is what has been built and why, and [`TODO.md`](TODO.md) is what is left.
 | `pyproject.toml`  | Package metadata, dependencies, `agent` script  |
 
 `agent.py` is a single flat module divided by commented section banners, in this
-order: **config, events, prompt, storage, sessions, memory, repository, models,
-tools, console, commands, core, web, cli**. Each section is self-contained and depends
+order: **config, events, prompt, storage, sessions, memory, repository,
+resilience, models, tools, console, commands, core, web, cli**. Each section is self-contained and depends
 only on the ones above it, so the file reads top to bottom.
 
 Dependencies: `openai` and `openai-agents` (the loop), `jinja2` (templates),
@@ -73,14 +73,18 @@ same in either.
    remembers, so the prompt is the newest message of a conversation rather than
    a one shot request.
 9. **Stream.** `stream()` consumes the SDK event stream and republishes it as
-   `block.*` and `tool.*` events.
+   `block.*` and `tool.*` events, under a stall guard and, while nothing has
+   been produced yet, the retry policy of the run.
 10. **Remember.** `remember()` appends the exchange to the transcript of the
     session, trimming (or summarising) it back inside its budget.
-11. **Finish.** `agent.end` (or `agent.error`) is published and a `RunResult` is
-    returned; cancellation is re-raised after being recorded.
+11. **Finish.** `agent.end` (or `agent.error`) is published with the tokens and
+    the cost of the run, and a `RunResult` is returned; cancellation is
+    re-raised after being recorded.
 
 Failures inside the loop are captured on the result rather than raised, so a
-caller always gets a `RunResult` and can branch on `result.ok`.
+caller always gets a `RunResult` and can branch on `result.ok`, on
+`result.error_kind` for what went wrong and on `result.transient` for whether
+running it again might work.
 
 ## 4. Config
 
@@ -107,6 +111,11 @@ run in `resolve_config()`.
 | `AGENT_NAME`, `AGENT_INSTRUCTIONS`                          | Agent name and system instructions          |
 | `AGENT_MODEL`, `AGENT_API_URL`, `AGENT_API_KEY`             | Leader model, endpoint and credential       |
 | `AGENT_MAX_TURNS`                                           | Maximum agentic turns per run               |
+| `AGENT_REQUEST_TIMEOUT`                                     | Timeout per model call; leader stall guard  |
+| `AGENT_RETRY_ATTEMPTS`                                      | Attempts per model call (`1` never retries) |
+| `AGENT_RETRY_BACKOFF`, `AGENT_RETRY_MAX_BACKOFF`            | First wait between attempts, and its cap    |
+| `AGENT_RETRY_JITTER`                                        | Fraction of a wait that is randomized       |
+| `AGENT_COST_INPUT`, `AGENT_COST_OUTPUT`                     | Price of a million input / output tokens    |
 | `AGENT_VISION_MODEL`                                        | Vision specialist (unset: the leader sees)  |
 | `AGENT_VISION_API_URL`, `AGENT_VISION_API_KEY`              | Vision endpoint (defaults to the leader's)  |
 | `AGENT_VISION_INSTRUCTIONS`, `AGENT_VISION_MAX_TOKENS`      | Vision system prompt and answer budget      |
@@ -142,13 +151,14 @@ Handlers may be sync or async; exceptions are printed to stderr and swallowed.
 | Event                          | Payload                                    |
 | ------------------------------ | ------------------------------------------ |
 | `agent.start`                  | `config` (never forwarded to the web)      |
-| `agent.end`                    | `output`, `error`, `config`                |
-| `agent.error`                  | `error`                                    |
+| `agent.end`                    | `output`, `error`, `error_kind`, `usage`, `config` |
+| `agent.error`                  | `error`, `error_kind`                      |
 | `block.start`                  | `id`, `kind`, `role`                       |
 | `block.delta`                  | `id`, `kind`, `text` (the delta)           |
 | `block.end`                    | `id`, `kind`, `text` (the full block)      |
 | `tool.start`                   | `id`, `kind`, `name`, `call_id`, `arguments`, `text` |
 | `tool.end`                     | the above plus `ok`, `result`, `duration`  |
+| `model.retry`                  | `role`, `error_kind`, `attempt`, `attempts`, `delay`, `error` |
 | `session.open`, `session.close`| `kind`, `repo`                             |
 | `log`                          | `kind`, `message`                          |
 
@@ -275,21 +285,85 @@ session and publishes `session.open`; a `RepoError` is logged and the session
 continues without a checkout. `Agent.checkout(session)` rebuilds a `Checkout`
 from the stored metadata.
 
-## 11. Models
+## 11. Resilience
+
+Every call to a provider is bounded and classified, because the two ways a run
+dies without the harness noticing are a provider that stops answering and a
+provider that answers with a failure nobody can interpret.
+
+`ErrorKind` is the taxonomy: `timeout`, `rate_limit`, `connection`, `server`,
+`auth`, `invalid_request`, `max_turns`, `cancelled` and `internal`, with
+`ErrorKind.TRANSIENT` naming the four an identical attempt may get past.
+`classify_error(exc)` places a failure by the class name of the exception
+(`ERROR_KINDS`, so no provider SDK has to be imported), then by the HTTP status
+it carries (`status_kind`), then by whether it is an `OSError`; anything left is
+`internal`. A failed model call is raised as a `ModelError` carrying `kind`,
+`role`, `attempts` and the `detail` the provider gave — except an `internal`
+one, which is re-raised untouched so a defect here is never dressed up as a
+provider fault.
+
+`RetryPolicy` is how a call is made: `attempts` in total, `timeout` per attempt,
+and a wait of `backoff * 2 ** (n - 1)` after failure *n*, capped at
+`max_backoff` and multiplied by a random factor in `[1 - jitter, 1]` so clients
+a provider failed together do not return together. `RetryPolicy.from_config()`
+reads `request_timeout` and the `retry_*` fields; `Engine.build_policy()` is the
+hook that returns it. `policy.call(operation, role=…, bounded=…, resumable=…,
+on_retry=…)` awaits the operation under all of it: cancellation is never
+retried, `resumable` lets the caller veto a retry, and `on_retry` publishes
+`model.retry`.
+
+Retrying belongs to the policy alone: `ModelPool.client()` builds its
+`AsyncOpenAI` with `max_retries=0`, because a retry inside the SDK is invisible
+to the event bus, unjittered, uncounted and nested inside whatever the harness
+is already doing. The transport timeout it keeps (from the policy of the pool,
+which `Engine` builds from the config) is what stops a socket that went quiet
+mid-response.
+
+The leader and the specialists are bounded differently, because they are shaped
+differently. A specialist completion is one request, so `ModelPool.complete()`
+wraps the whole call in the timeout. The leader's stream is a long lived read
+whose duration is legitimately unbounded, so `timeout` becomes a **stall
+guard** instead: `Engine.next_event()` bounds the wait for the *next* event, and
+`Engine.stall_timeout()` extends that budget by `shell_timeout` while a tool
+call is outstanding, since the SDK runs tools inside the same stream and a slow
+shell command must not look like a stalled provider. A stream that fails is
+retried only while `result.blocks` and `result.tools` are still empty: after
+that a second attempt would replay work the consumer has already seen, so the
+failure is reported instead. An abandoned stream is cancelled
+(`Engine.cancel_stream`) rather than left running.
+
+`Usage` is the accounting: `requests`, `retries`, `input_tokens`,
+`output_tokens`, `total_tokens` and `cost`. `record(raw)` accepts either naming
+(`input_tokens`/`prompt_tokens`) from an object or a dict, `price(in, out)`
+costs the tokens at rates quoted per million (`cost_input`, `cost_output`) and
+`to_dict()` is what `agent.end` carries. Each run owns one on
+`RunResult.usage`, and `Engine.running()` publishes it in the `_USAGE` context
+variable for the length of the run, so a model call made anywhere underneath —
+a tool delegating to the vision model, the summariser of the memory — is counted
+without being handed a sink (`current_usage()`, `record_usage()`). Concurrent
+runs never share it, because each run is its own task. `ModelPool.usage` keeps
+the totals of everything the pool has ever spent, `usage_of(streamed)` extracts
+what an SDK run reports, and a failed attempt is accounted too: the tokens were
+spent whether or not the answer arrived.
+
+## 12. Models
 
 `ModelSpec` is `(role, name, api_url, api_key)` with `endpoint` as its identity.
 `ModelPool` caches one `AsyncOpenAI` client per endpoint and one
 `OpenAIChatCompletionsModel` per `(name, url, key)`, and offers two calls beyond
 the loop: `complete(spec, messages, max_tokens=…)` for a single completion and
 `describe_image(spec, data_url, question, …)`, which sends the system
-instructions plus a text/image message pair and returns the text answer.
+instructions plus a text/image message pair and returns the text answer. Both
+take a `policy=`, a `usage=` sink and an `on_retry=` callback, and both fall
+back to the policy of the pool; what they spend lands on `ModelPool.usage`, on
+the sink and on the run in progress.
 
 `Agent.build_model(config, role)` pulls from the pool, disables SDK tracing and
 sets the leader's client as the SDK default. `Agent.build_vision(config)` returns
 a `(data_url, question) -> text` delegate, or `None` when no vision model is
 configured — which is exactly what decides the image tool.
 
-## 12. Tools
+## 13. Tools
 
 `Workspace` is the sandbox. `resolve()` rejects empty paths, strips quotes,
 anchors relative paths at the root and refuses anything that resolves outside it
@@ -324,7 +398,7 @@ while `functools.wraps` preserves the signature the SDK turns into a schema.
 The hosted SDK tools are not used: they need the Responses API, and Chat
 Completions backends only support plain function tools.
 
-## 13. Console
+## 14. Console
 
 `ConsoleRenderer.attach(bus)` subscribes to `EventType.ALL`. It prints a banner,
 opens and closes blocks as they stream, styles them per kind (dim italic
@@ -334,7 +408,7 @@ when the stream is not a TTY
 or `AGENT_COLOR` says so. `write()`, `style()` and `banner()` are the override
 points; `Agent(console=False)` or `AGENT_QUIET=1` removes it entirely.
 
-## 14. Commands
+## 15. Commands
 
 `CommandRegistry` maps a name to a description and a handler.
 `parse("/name args")` returns `(name, args)`, and `invoke(text, **context)`
@@ -363,19 +437,23 @@ client.
 
 `/clear` and `/theme` are client-side only and never reach the server.
 
-## 15. Core
+## 16. Core
 
 `Block` is a chronological unit of content (`id`, `kind`, `role`, `text`),
 `ToolCall` is one tool invocation (`name`, `call_id`, redacted `arguments`,
 `result`, `ok`, `duration`, with `signature()`, `report()` and `to_dict()`) and
 `RunResult` collects the blocks, the tool calls, the rendered prompt, the final
-output and the error, with `ok` and `text_of(kind)`.
+output, the error and its `error_kind`, plus the `usage` of every model call the
+run made, with `ok`, `transient`, `fail(error, kind)` and `text_of(kind)`.
 
 `Engine.run()` is the loop on its own, `Agent.run()` is the loop inside a
 session; both wrap the body in `running()`, the async context manager that
-publishes `agent.start`, records a failure as `result.error` (re-raising only
-cancellation) and always publishes `agent.end`. `turn()` builds the workspace,
-the tools and the SDK agent for one pass and hands it to `stream()`.
+publishes `agent.start`, records a failure as `result.error` and its classified
+`result.error_kind` (re-raising only cancellation), holds the usage of the run in
+the `_USAGE` context variable while the body runs and always publishes
+`agent.end` with the priced tokens. `turn()` builds the workspace, the tools and
+the SDK agent for one pass and hands it to `stream()` under the retry policy of
+the run.
 
 `Engine.stream()` consumes `Runner.run_streamed(...).stream_events()`, keeps only
 raw response events and maps them with `DELTA_KINDS`:
@@ -404,7 +482,7 @@ key that looks like a credential (`token`, `password`, `api_key`, … — the
 workspace and clears the cache and the store; `aclose()` does it off the loop and
 both classes are async context managers.
 
-## 16. Web layer
+## 17. Web layer
 
 `WebServer` serves three things on one port: the page assets, a read-only REST
 surface and the websocket hub at `/ws`. It subscribes to the bus and forwards
@@ -455,7 +533,7 @@ with sanitized names and passed to the run as `extras["attachments"]`.
 onto the CSS custom properties the page uses, and the result is served at
 `/api/theme` and sent in the `hello` message.
 
-## 17. Web client
+## 18. Web client
 
 `agent_ui.js` is six small subsystems over one socket:
 
@@ -491,7 +569,7 @@ tool and log blocks are monospaced and muted, a tool block keeps its whitespace
 and is labelled with the tool name (turning red when the call failed); a
 streaming block pulses.
 
-## 18. CLI
+## 19. CLI
 
 `parse_args()` accepts exactly `--input` and `--serve`. `load_template()`
 resolves the template from `AGENT_TEMPLATE` (a path or raw text), then
@@ -500,7 +578,7 @@ resolves the template from `AGENT_TEMPLATE` (a path or raw text), then
 either serves or performs one run and returns a process exit code, closing the
 agent either way.
 
-## 19. Extending
+## 20. Extending
 
 Everything is a hook, an injectable collaborator or a registry entry. Start from
 `Engine` when the application owns its own sessions and history, and from
@@ -528,7 +606,8 @@ agent.commands.register("mode", "Switch mode", my_handler)
 
 Common overrides: `resolve_config`, `build_prompt`, `decorate_prompt`,
 `build_model`, `build_vision`, `build_summarizer`, `build_tools`,
-`build_sdk_agent`, `build_input`, `remember`, `turn`, `stream`, `prepare_session`,
+`build_sdk_agent`, `build_input`, `build_policy`, `stall_timeout`, `remember`,
+`turn`, `stream`, `prepare_session`,
 `register_default_commands`, `ConversationMemory.trim`, `ConsoleRenderer.write` /
 `.style`, `WebServer.encode` / `.rest` / `.register_handlers`, `Hub.connected`.
 
@@ -539,7 +618,12 @@ Adding a model role: add `<role>_model` / `<role>_api_url` / `<role>_api_key`
 fields, resolve them with `config.model_spec(role)` and call
 `agent.models.model(spec)` or `agent.models.complete(spec, messages)`.
 
-## 20. Tests
+Bounding a deployment differently: override `build_policy()` to return a
+`RetryPolicy` per role or per model, widen `transient` to retry a kind the
+provider misreports, or override `Usage.price` (or read `result.usage` on
+`agent.end`) for per-model pricing.
+
+## 21. Tests
 
 ```
 python -m unittest agent_test -v
@@ -547,7 +631,10 @@ python -m unittest agent_test -v
 
 `agent_test.py` covers the embedded `Engine` path (no batteries, verbatim model
 input, supplied or workspace built tools, trapped failures), config layering and redaction, model specs and the pool,
-input resolution, the event bus, prompt rendering, both stores and the cache,
+the error taxonomy, the retry policy (backoff, jitter, bounded attempts,
+timeouts, cancellation), token and cost accounting, the stall guard around the
+leader's stream, input resolution, the event bus, prompt rendering, both stores
+and the cache,
 session isolation and cleanup, session durability (rehydration,
 reconciliation, reaping and the sweeper), conversation memory (persistence,
 trimming, summarising, replay), workspace path scoping (including symlinks and
@@ -556,7 +643,7 @@ URL normalization, git operations against local fixture repositories, pull
 request posting against a stubbed forge, command parsing and the websocket
 protocol codec. No test needs a network or a model.
 
-## 21. Example consumer
+## 22. Example consumer
 
 [`utils/storynu`](../storynu) owns only its content: `story_prompt.md`, a Jinja
 template that injects `config.input`, and `story.py`, which subclasses `Agent` to
