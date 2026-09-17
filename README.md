@@ -101,5 +101,3 @@ python -m unittest agent_test -v
   configuration, tool, command and protocol reference.
 - [CHANGES.md](CHANGES.md) — what has been built and why it is built that way.
 - [TODO.md](TODO.md) — what is still open.
-- [`utils/storynu`](../storynu) — an example consumer: a prompt template and a
-  small `Agent` subclass.

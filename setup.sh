@@ -6,46 +6,80 @@ cd "$SCRIPT_DIR"
 
 command_exists() { command -v "$1" >/dev/null 2>&1; }
 
-# Python
-if command_exists python3; then
-    echo "Python already installed: $(python3 --version)"
-elif command_exists python; then
-    echo "Python already installed: $(python --version)"
-else
-    echo "Python 3 not found; install it via your package manager (e.g. apt install python3)."
-    exit 1
-fi
+update_path() {
+    export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+}
 
-# C compiler
-if command_exists cc || command_exists clang || command_exists gcc; then
-    echo "C compiler already installed."
-else
-    echo "C compiler not found; install clang or gcc via your package manager."
-    exit 1
-fi
-
-# ext/ dependencies
-if [ ! -f "ext/minifb/include/MiniFB.h" ]; then
-    echo "ext/minifb missing; copying from apps/.lib99/dskbuf..."
-    LIB99="$(dirname "$SCRIPT_DIR")/.lib99/dskbuf"
-    if [ -d "$LIB99" ]; then
-        mkdir -p "ext/minifb"
-        cp -r "$LIB99/." "ext/minifb/"
-    else
-        echo "WARNING: apps/.lib99/dskbuf not found; ext/minifb must be provided manually."
+install_uv() {
+    if command_exists uv; then
+        echo "uv already installed: $(uv --version)"
+        return
     fi
-fi
+    echo "uv not found; installing it..."
+    curl -LsSf https://astral.sh/uv/install.sh | sh
+    update_path
+    if ! command_exists uv; then
+        echo "ERROR: uv was installed but is not on PATH. Open a new terminal and run setup.sh again." >&2
+        exit 1
+    fi
+}
 
-# Runtime-id output dir (build/<rid>), matching make.py.
-case "$(uname -s)" in
-    MINGW*|MSYS*|CYGWIN*) rid_os="win" ;;
-    Darwin*)              rid_os="osx" ;;
-    *)                    rid_os="linux" ;;
-esac
-case "$(uname -m)" in
-    x86_64|amd64) rid_arch="x64" ;;
-    aarch64|arm64) rid_arch="arm64" ;;
-    *)             rid_arch="x86" ;;
-esac
-mkdir -p "build/$rid_os-$rid_arch/shots" docs/shots
-echo "rpg99 build tools are ready."
+install_python() {
+    if uv python find 3.12 >/dev/null 2>&1; then
+        echo "Python 3.12 available: $(uv python find 3.12)"
+    else
+        echo "Python 3.12 not found; installing it via uv..."
+        uv python install 3.12
+    fi
+
+    local venv_python="$SCRIPT_DIR/.venv/bin/python"
+    if [ ! -x "$venv_python" ]; then
+        echo "Creating virtual environment in .venv..."
+        uv venv --python 3.12 .venv
+    fi
+    uv pip install --python "$venv_python" -e .
+
+    update_path
+    if ! command_exists python; then
+        echo "ERROR: Python was installed but is not on PATH. Open a new terminal and run setup.sh again." >&2
+        exit 1
+    fi
+}
+
+install_clang() {
+    if command_exists cc || command_exists clang || command_exists gcc; then
+        echo "C compiler already installed."
+        return
+    fi
+    echo "C compiler not found; installing LLVM/Clang..."
+
+    if command_exists apt-get; then
+        sudo apt-get update && sudo apt-get install -y clang
+    elif command_exists dnf; then
+        sudo dnf install -y clang
+    elif command_exists pacman; then
+        sudo pacman -S --noconfirm clang
+    elif command_exists brew; then
+        brew install llvm
+        update_path
+        if ! command_exists clang; then
+            echo "WARNING: LLVM was installed but clang is not on PATH. Open a new terminal and run setup.sh again."
+            return
+        fi
+    else
+        echo "WARNING: no supported package manager found; install LLVM/Clang or GCC manually."
+        return
+    fi
+
+    update_path
+    if ! command_exists clang; then
+        echo "WARNING: LLVM was installed but clang is not on PATH. Open a new terminal and run setup.sh again."
+    fi
+}
+
+install_uv
+install_python
+install_clang
+
+echo "Setup complete."
+echo "Activate the environment with: source .venv/bin/activate"

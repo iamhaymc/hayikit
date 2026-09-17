@@ -11,12 +11,7 @@ dependencies = [
     "cachetools",
     "git+https://github.com/huggingface/transformers",
     "accelerate",
-    "peft",
-    "evaluate",
-    "ultralytics",
-    "pillow",
-    "kokoro",
-    "soundfile"
+    "pillow"
 ]
 
 [project.scripts]
