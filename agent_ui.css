@@ -34,6 +34,12 @@
   min-width: 0;
 }
 
+/* A class that sets `display` outranks the browser rule behind `hidden`, so
+   the attribute has to win here or a hidden button stays on screen. */
+[hidden] {
+  display: none !important;
+}
+
 html,
 body {
   height: 100%;

@@ -16,9 +16,11 @@ is what has been built and why, and [`TODO.md`](TODO.md) is what is left.
 | ----------------- | ----------------------------------------------- |
 | `agent.py`        | The library: every subsystem and the CLI        |
 | `agent_test.py`   | Unit tests                                      |
+| `agent_e2e.py`    | Browser capture of the page, scripted end to end |
 | `agent_ui.html` | Chat page markup                                |
 | `agent_ui.css`  | Mobile first, theme driven styles               |
 | `agent_ui.js`   | Client: blocks, markdown, media, commands, hub  |
+| `assets/`         | The screenshots this guide shows                |
 | `pyproject.toml`  | Package metadata, dependencies, `agent` script  |
 
 `agent.py` is a single flat module divided by commented section banners, in this
@@ -660,6 +662,54 @@ tool and log blocks are monospaced and muted, a tool block keeps its whitespace
 and is labelled with the tool name (turning red when the call failed); a
 streaming block pulses.
 
+### Screenshots
+
+`agent_e2e.py` is the page as it actually renders. It starts the real server with
+a scripted agent behind it — no provider, no key, a fixed answer that pauses
+halfway through — drives the page with Playwright and writes the images below
+into `assets/`:
+
+```
+pip install -e ".[e2e]"
+playwright install chromium
+python agent_e2e.py
+```
+
+Three moments are captured per device: after launch, during the request (half the
+answer written, the tool call closed, the stop button live) and after the
+response.
+
+Desktop, 1440×900:
+
+<p>
+  <img src="assets/desktop-launch.png" alt="Desktop, after launch" width="32%">
+  <img src="assets/desktop-request.png" alt="Desktop, during a request" width="32%">
+  <img src="assets/desktop-response.png" alt="Desktop, after the response" width="32%">
+</p>
+
+Phone in portrait, 390×844 at 2×:
+
+<p>
+  <img src="assets/phone-portrait-launch.png" alt="Phone in portrait, after launch" width="32%">
+  <img src="assets/phone-portrait-request.png" alt="Phone in portrait, during a request" width="32%">
+  <img src="assets/phone-portrait-response.png" alt="Phone in portrait, after the response" width="32%">
+</p>
+
+Phone in landscape, 844×390 at 2×:
+
+<p>
+  <img src="assets/phone-landscape-launch.png" alt="Phone in landscape, after launch" width="32%">
+  <img src="assets/phone-landscape-request.png" alt="Phone in landscape, during a request" width="32%">
+  <img src="assets/phone-landscape-response.png" alt="Phone in landscape, after the response" width="32%">
+</p>
+
+The pieces are small enough to borrow: `ScriptedAgent` replaces only
+`build_tools`, `build_sdk_agent` and `stream`, so sessions, memory, the event
+bridge, the hub and the page are the real thing; `Gate` parks the run mid answer
+until the capture lets it go, which is what makes the middle frame the same
+picture every time; `Server` runs the web layer on a background thread and hands
+back its URL. `--device`, `--out`, `--pace` and `--browser` cover the rest.
+
 ## 20. CLI
 
 `parse_args()` accepts `--input`, `--repl`, `--serve` and `--config`.
@@ -749,7 +799,12 @@ URL normalization, git operations against local fixture repositories, pull
 request posting against a stubbed forge, command parsing, config file resolution
 (search order, JSON and YAML, nested groups, coercion, the layers around it), the
 repl (prompts, commands, sessions, interrupts, the banner) driven by an injected
-reader, and the websocket protocol codec. No test needs a network or a model.
+reader, the websocket protocol codec, and the scripted agent `agent_e2e.py`
+drives. No test needs a network or a model.
+
+`agent_e2e.py` is the one that needs a browser: it is not part of the unit suite,
+it is run by hand (or in CI) to prove the page still works end to end and to
+refresh the screenshots above.
 
 ## 23. Example consumer
 
