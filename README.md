@@ -64,7 +64,33 @@ or injected below works in both.
 
 ## Install
 
+The package is on GitHub and can be installed straight from the repository with
+any PEP 508 installer (requires Python 3.12+):
+
 ```
+uv add "agent @ git+https://github.com/iamhaymc/hayikit"
+```
+
+or with pip:
+
+```
+pip install "agent @ git+https://github.com/iamhaymc/hayikit"
+```
+
+You can pin to a tag or a commit:
+
+```
+pip install "agent @ git+https://github.com/iamhaymc/hayikit@v0.1.0"
+pip install "agent @ git+https://github.com/iamhaymc/hayikit@<commit-sha>"
+```
+
+Note that the transformers dependency is itself pulled from GitHub, so the
+first install may take a while.
+
+To develop on hayikit itself:
+
+```
+git clone https://github.com/iamhaymc/hayikit && cd hayikit
 uv venv --python 3.12 .venv
 uv pip install --python .venv/bin/python -e .
 ```
