@@ -35,5 +35,6 @@
 
 - agent.py: the whole implementation — `Agent` and `Engine`
 - agent_test.py: tests
+- agent_e2e.py: browser capture of the web UI, writes assets/
 - agent_ui.html / agent_ui.css / agent_ui.js: web UI served by `Agent`
 - pyproject.toml: package metadata and dependencies

@@ -461,6 +461,24 @@ dropped socket degrades visibly instead of silently swallowing input. Theming
 reads a subset of the VS Code theme spec and maps it onto CSS custom properties,
 which gives the whole UI a palette from a file the user already has.
 
+## End to end capture
+
+`agent_e2e.py` exists because the page was the one subsystem nothing looked at.
+Every other part is asserted by `agent_test.py`, while the client was only ever
+checked by a person opening a browser — so the two defects below sat in plain
+sight.
+
+It serves the real web layer on a background thread and drives it with
+Playwright, replacing only the three seams that reach a provider
+(`build_tools`, `build_sdk_agent`, `stream`); sessions, memory, the event bridge,
+the hub, the markup, the styles and the client are all the shipped ones, so a
+capture is a test of the page rather than of a mock of it. The scripted run parks
+itself in the middle of its answer until the capture releases it, because the
+alternative — sleeping and hoping — photographs a different frame every time.
+Nine images (three moments across a desktop, a phone in portrait and a phone in
+landscape) are written to `assets/` and shown in [`GUIDE.md`](GUIDE.md), which
+makes a layout regression something a reader can see in a diff.
+
 ## Consumer port: storynu
 
 `utils/storynu` was rewritten onto the harness to prove the boundary: it owns
@@ -521,6 +539,9 @@ harness.
     and YAML file layer between the defaults and the environment
     (`find_config_file`, `read_config_file`, `AgentConfig.with_file`), and a
     template that the config file can name.
+27. End to end capture: `agent_e2e.py`, a scripted agent behind the real server,
+    a Playwright pass over desktop and phone viewports, and the screenshots in
+    `assets/` that `GUIDE.md` shows.
 
 ## Fixes worth remembering
 
@@ -555,3 +576,13 @@ harness.
   and a local Ollama could not be reached over a credential it never asks for.
   An empty key now falls back to a placeholder, with a set `OPENAI_API_KEY`
   still winning.
+- **Two content types on every asset.** The response header map appends rather
+  than overwrites, so setting `Content-Type` on top of the `text/plain` the
+  transport had already written sent both — and the browser believed the first.
+  The stylesheet was fetched and ignored on every load, and the page had been
+  rendering unstyled since the web layer was written. `WebServer.retype()` now
+  clears the header before setting it.
+- **A hidden button that stayed on screen.** `.icon-button { display: grid }`
+  outranks the browser rule behind the `hidden` attribute, so hiding send and
+  showing stop did neither: both sat in the composer through every run. A single
+  `[hidden] { display: none !important }` rule restores the attribute.

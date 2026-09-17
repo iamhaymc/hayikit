@@ -2208,6 +2208,58 @@ class WebServerTest(unittest.TestCase):
         self.assertEqual(A.safe_name(""), "file")
         self.assertEqual(A.safe_name("a b?c.txt"), "a_b_c.txt")
 
+    def test_content_type_replaces_the_one_the_transport_set(self):
+        from websockets.datastructures import Headers
+
+        response = types.SimpleNamespace(headers=Headers())
+        response.headers["Content-Type"] = "text/plain; charset=utf-8"
+        A.WebServer.retype(response, "text/css; charset=utf-8")
+        self.assertEqual(
+            response.headers.get_all("Content-Type"), ["text/css; charset=utf-8"]
+        )
+
+
+class E2eCaptureTest(unittest.TestCase):
+    """The scripted agent behind `agent_e2e.py`, without a browser."""
+
+    def setUp(self):
+        import agent_e2e as E
+
+        self.E = E
+        self.gate = E.Gate()
+        self.agent = E.ScriptedAgent(
+            console=False,
+            env=False,
+            config_file=False,
+            gate=self.gate,
+            pace=0.0,
+            store=A.MemoryStore(),
+        )
+        self.addCleanup(self.agent.close)
+
+    def test_chunks_rebuild_the_text_they_came_from(self):
+        text = self.E.ANSWER_HEAD + self.E.ANSWER_TAIL
+        self.assertEqual("".join(self.E.chunks(text)), text)
+
+    def test_the_run_holds_until_the_capture_releases_it(self):
+        seen = []
+        self.agent.events.on(A.EventType.ALL, lambda event: seen.append(event.type))
+
+        async def drive():
+            task = asyncio.ensure_future(self.agent.run("{{ config.input }}", input=self.E.PROMPT))
+            while not self.gate.reached.is_set():
+                await asyncio.sleep(0.01)
+            held = list(seen)
+            self.gate.release()
+            return held, await task
+
+        held, result = run(drive())
+        self.assertIn(A.EventType.TOOL_END, held)
+        self.assertNotIn(A.EventType.BLOCK_END, held)
+        self.assertTrue(result.ok)
+        self.assertEqual(result.output, self.E.ANSWER_HEAD + self.E.ANSWER_TAIL)
+        self.assertEqual([call.name for call in result.tools], [self.E.TOOL_NAME])
+
 
 class ConfigFileTest(unittest.TestCase):
     """The file layer: JSON or YAML, the cwd first and the module next to it."""

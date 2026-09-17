@@ -15,6 +15,9 @@ dependencies = [
     "pillow"
 ]
 
+[project.optional-dependencies]
+e2e = ["playwright"]
+
 [project.scripts]
 agent = "agent:main"
 

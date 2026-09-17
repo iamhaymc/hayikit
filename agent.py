@@ -4551,16 +4551,30 @@ class WebServer:
             if not file.is_file():
                 return connection.respond(404, "Not Found")
             response = connection.respond(200, file.read_text(encoding="utf-8"))
-            response.headers["Content-Type"] = content_type
+            self.retype(response, content_type)
             response.headers["Cache-Control"] = "no-cache"
             return response
         rest = self.rest(path)
         if rest is not None:
             status, body = rest
             response = connection.respond(status, body)
-            response.headers["Content-Type"] = "application/json"
+            self.retype(response, "application/json")
             return response
         return connection.respond(404, "Not Found")
+
+    @staticmethod
+    def retype(response: Any, content_type: str) -> Any:
+        """Set the content type of a response, replacing the one it was built with.
+
+        The header map appends rather than overwrites, so assigning on top of
+        the ``text/plain`` the transport picked would send two content types and
+        the browser would believe the first — which is how a stylesheet ends up
+        ignored.
+        """
+        with contextlib.suppress(KeyError):
+            del response.headers["Content-Type"]
+        response.headers["Content-Type"] = content_type
+        return response
 
     async def serve(self) -> None:
         """Serve until cancelled."""
