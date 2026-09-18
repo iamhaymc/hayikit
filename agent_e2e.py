@@ -62,6 +62,11 @@ BROWSER_CANDIDATES = (
 
 PROMPT = "Read agent.py and summarise what the harness does."
 
+REASONING = """\
+The file is one module, so the summary should follow its sections rather than \
+its classes. Read it first, then describe the three layers and how to run them.
+"""
+
 TOOL_NAME = "read_file"
 TOOL_ARGUMENTS = {"path": "agent.py"}
 TOOL_RESULT = "agent.py — 4656 lines, 16 sections"
@@ -76,7 +81,10 @@ ANSWER_TAIL = """\
 - **Agent** — the engine plus storage, sessions, memory, git checkouts, slash commands, the console renderer, the repl and the web layer.
 - **Web** — a read only REST surface and a websocket hub that pushes every block to this page while it is being written.
 
-Run `agent --serve` for this UI and `agent --repl` for the terminal.
+| Entry point | What it gives you |
+| --- | --- |
+| `agent --serve` | this page |
+| `agent --repl` | the terminal |
 """
 
 
@@ -156,7 +164,8 @@ class ScriptedAgent(A.Agent):
         config: A.AgentConfig,
         result: A.RunResult,
     ) -> A.RunResult:
-        """Publish the scripted tool call and answer as the real stream would."""
+        """Publish the scripted reasoning, tool call and answer as the real stream would."""
+        await self.think(result)
         await self.call_tool(result)
         block = A.Block(
             id=f"{result.session_id}-answer", kind="output", session_id=result.session_id
@@ -181,6 +190,30 @@ class ScriptedAgent(A.Agent):
         )
         result.output = block.text
         return result
+
+    async def think(self, result: A.RunResult) -> None:
+        """One reasoning block, so the page shows what the model thought."""
+        block = A.Block(
+            id=f"{result.session_id}-reasoning",
+            kind="reasoning",
+            session_id=result.session_id,
+        )
+        result.blocks.append(block)
+        await self.events.publish(
+            A.EventType.BLOCK_START,
+            session_id=result.session_id,
+            id=block.id,
+            kind=block.kind,
+            role=block.role,
+        )
+        await self.write(block, REASONING)
+        await self.events.publish(
+            A.EventType.BLOCK_END,
+            session_id=result.session_id,
+            id=block.id,
+            kind=block.kind,
+            text=block.text,
+        )
 
     async def call_tool(self, result: A.RunResult) -> None:
         """One tool call, started and finished, so the page shows a tool block."""
@@ -422,6 +455,7 @@ def capture(browser: Any, device: Device, url: str, gate: Gate, out: Path) -> li
             "[data-streaming=\"true\"]')"
         )
         settle(page)
+        assert_streaming(page)
         written.append(shoot(page, out, device, "request"))
 
         gate.release()
@@ -434,6 +468,30 @@ def capture(browser: Any, device: Device, url: str, gate: Gate, out: Path) -> li
     finally:
         context.close()
     return written
+
+
+def assert_streaming(page: Any) -> None:
+    """Fail the capture unless the page is painting the answer as it arrives.
+
+    Held at the gate the page must already show the reasoning and the first
+    half of the answer, and only the first half: a client that waited for the
+    block to end would show nothing here.
+    """
+    text = page.evaluate(
+        """() => {
+          const body = (kind) =>
+            (document.querySelector(`.block[data-kind="${kind}"] .block-body`) || {})
+              .textContent || "";
+          return { reasoning: body("reasoning"), output: body("output") };
+        }"""
+    )
+    if not text["reasoning"].strip():
+        raise AssertionError("the reasoning block was never shown")
+    written = text["output"].strip()
+    if not written:
+        raise AssertionError("no part of the answer was painted while it streamed")
+    if len(written) >= len(ANSWER_HEAD) + len(ANSWER_TAIL):
+        raise AssertionError("the whole answer was painted at once, not as it arrived")
 
 
 def settle(page: Any, milliseconds: int = 250) -> None:

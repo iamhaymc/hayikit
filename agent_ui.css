@@ -1,8 +1,12 @@
 /* Mobile first, centered, content shrinks before it wraps.
    Colors come from a subset of the VS Code theme spec (see THEME_KEYS in
-   agent.py); every value below is the fallback used without a theme. */
+   agent.py); every value below is the fallback used without a theme. A theme
+   only ever sets the variables it actually defines, so the two fallback
+   palettes below — one per theme type — have to be complete on their own. */
 
 :root {
+  color-scheme: dark;
+
   --bg: #14161a;
   --bg-soft: #191c21;
   --bg-raised: #1f232a;
@@ -15,18 +19,48 @@
   --input-bg: #1b1f25;
   --input-fg: #e6ebf2;
   --input-border: #2a2f37;
-  --code-bg: #12151a;
+  --code-bg: #1c2028;
   --link: #6cb6ff;
   --error: #f2686c;
   --badge-bg: #2a2f37;
   --badge-fg: #d8dee9;
   --scroll: #333a44;
+  --shadow: rgba(0, 0, 0, 0.3);
 
   --gap: 0.625rem;
   --radius: 0.625rem;
   --shell: 52rem;
+  --control: 2.25rem;
+  --input-max: 11rem;
   --font: ui-sans-serif, system-ui, "Segoe UI", Roboto, sans-serif;
   --mono: ui-monospace, "Cascadia Code", "JetBrains Mono", Consolas, monospace;
+}
+
+/* A light VS Code theme names a handful of colors and leaves the rest to us;
+   without this the unnamed half of the palette would stay dark. */
+:root[data-theme-type="light"],
+:root[data-theme-type="hc-light"] {
+  color-scheme: light;
+
+  --bg: #ffffff;
+  --bg-soft: #f4f5f7;
+  --bg-raised: #ebedf0;
+  --fg: #24292f;
+  --muted: #61676f;
+  --border: #d5d9de;
+  --accent: #1a6ed8;
+  --accent-fg: #ffffff;
+  --focus: #1a6ed8;
+  --input-bg: #ffffff;
+  --input-fg: #24292f;
+  --input-border: #d5d9de;
+  --code-bg: #f1f3f6;
+  --link: #0a58ca;
+  --error: #c4373b;
+  --badge-bg: #e3e6ea;
+  --badge-fg: #24292f;
+  --scroll: #c2c7ce;
+  --shadow: rgba(16, 24, 40, 0.1);
 }
 
 * {
@@ -53,9 +87,21 @@ body {
   -webkit-text-size-adjust: 100%;
 }
 
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  border: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
 .app {
   display: grid;
-  grid-template-rows: auto 1fr auto;
+  grid-template-rows: auto minmax(0, 1fr) auto;
   height: 100dvh;
   max-width: var(--shell);
   margin: 0 auto;
@@ -63,46 +109,138 @@ body {
 
 /* ---------------------------------------------------------------- header */
 
+/* Both bars sit above the discussion; each casts a hairline of shadow onto it
+   only while there is something under that edge to pass behind, which is what
+   `data-under-head` and `data-under-foot` say. They have to be stacked to
+   paint over a later sibling. */
 .bar {
+  position: relative;
+  z-index: 1;
   display: flex;
   align-items: center;
   gap: var(--gap);
   padding: 0.5rem 0.75rem;
   border-bottom: 1px solid var(--border);
   background: var(--bg-soft);
+  transition: box-shadow 0.15s ease;
 }
 
+.app[data-under-head="true"] .bar {
+  box-shadow: 0 2px 3px -2px var(--shadow);
+}
+
+/* The mark is the title and the status light at once: connection and activity
+   are read off its color, its ring and its motion, so nothing else has to say
+   them. */
 .brand {
-  font-weight: 600;
-  letter-spacing: 0.02em;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.status {
   display: inline-flex;
   align-items: center;
-  gap: 0.4rem;
-  margin-left: auto;
+  justify-content: center;
+  flex: none;
   color: var(--muted);
-  font-size: 0.78rem;
-  white-space: nowrap;
+  transition: color 0.25s ease;
 }
 
-.dot {
-  width: 0.5rem;
-  height: 0.5rem;
-  border-radius: 50%;
-  background: var(--error);
-  transition: background 0.2s ease;
+.mark {
+  width: 1.55rem;
+  height: 1.55rem;
+  overflow: visible;
 }
 
-.app[data-state="online"] .dot {
-  background: var(--accent);
+.mark-halo,
+.mark-ring {
+  fill: none;
+  stroke: currentColor;
+  transform-box: fill-box;
+  transform-origin: center;
+}
+
+.mark-halo {
+  stroke-width: 1;
+  opacity: 0;
+}
+
+.mark-ring {
+  stroke-width: 1.75;
+  stroke-linecap: round;
+  transition: stroke-dasharray 0.25s ease;
+}
+
+.mark-core {
+  fill: currentColor;
+  transform-box: fill-box;
+  transform-origin: center;
+  transition: opacity 0.25s ease;
+}
+
+/* connecting: a gap chasing itself around a dim ring */
+.app[data-state="connecting"] .mark-ring {
+  stroke-dasharray: 13 36;
+  animation: spin 1.1s linear infinite;
+}
+
+.app[data-state="connecting"] .mark-core {
+  opacity: 0.45;
+}
+
+/* online: whole ring, full core, accent colored */
+.app[data-state="online"] .brand {
+  color: var(--accent);
+}
+
+/* offline: dotted ring, hollow core, error colored */
+.app[data-state="offline"] .brand {
+  color: var(--error);
+}
+
+.app[data-state="offline"] .mark-ring {
+  stroke-dasharray: 1.5 4.5;
+}
+
+.app[data-state="offline"] .mark-core {
+  opacity: 0.3;
+}
+
+/* busy: the halo breathes and the ring turns while a run is in flight */
+.app[data-busy="true"] .mark-halo {
+  animation: breathe 1.6s ease-in-out infinite;
+}
+
+.app[data-busy="true"] .mark-ring {
+  stroke-dasharray: 30 19;
+  animation: spin 2.4s linear infinite;
+}
+
+.app[data-busy="true"] .mark-core {
+  animation: throb 1.6s ease-in-out infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes breathe {
+  0%,
+  100% {
+    opacity: 0;
+    transform: scale(0.82);
+  }
+  50% {
+    opacity: 0.55;
+    transform: scale(1);
+  }
+}
+
+@keyframes throb {
+  50% {
+    transform: scale(0.72);
+  }
 }
 
 .session {
+  margin-left: auto;
   color: var(--muted);
   font: 0.72rem var(--mono);
   overflow: hidden;
@@ -118,6 +256,7 @@ body {
   flex-direction: column;
   gap: var(--gap);
   padding: var(--gap) 0.75rem;
+  min-height: 0;
   overflow-y: auto;
   overscroll-behavior: contain;
   scrollbar-color: var(--scroll) transparent;
@@ -132,7 +271,7 @@ body {
 .block {
   border: 1px solid transparent;
   border-radius: var(--radius);
-  padding: 0.55rem 0.75rem;
+  padding: 0.4rem 0.6rem 0.55rem;
   animation: fade 0.15s ease-out;
 }
 
@@ -147,20 +286,90 @@ body {
   .block {
     animation: none;
   }
+
+  .mark-halo,
+  .mark-ring,
+  .mark-core {
+    animation: none !important;
+  }
 }
 
 .block-head {
   display: flex;
   align-items: center;
-  gap: 0.5rem;
+  gap: 0.35rem;
   color: var(--muted);
   font-size: 0.72rem;
+}
+
+/* The whole label is the collapse affordance; the chevron says which way. */
+.block-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.35rem;
+  min-width: 0;
+  margin: 0;
+  padding: 0.1rem 0.2rem;
+  border: 0;
+  border-radius: 0.35rem;
+  background: none;
+  color: inherit;
+  font: inherit;
   text-transform: lowercase;
+  cursor: pointer;
+}
+
+.block-toggle:hover {
+  color: var(--fg);
+}
+
+.chevron {
+  flex: none;
+  width: 0.85rem;
+  height: 0.85rem;
+  transition: transform 0.15s ease;
+}
+
+.block[data-collapsed="true"] .chevron {
+  transform: rotate(-90deg);
+}
+
+.block-toggle .kind {
+  flex: none;
+  width: 0.95rem;
+  height: 0.95rem;
+}
+
+.block-toggle .label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .block-head .time {
   margin-left: auto;
   font-family: var(--mono);
+}
+
+/* A button group per block. It stays legible without a pointer and lifts to
+   full strength on hover, focus or touch. */
+.block-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.15rem;
+  flex: none;
+  opacity: 0.5;
+  transition: opacity 0.15s ease;
+}
+
+.block:hover .block-actions,
+.block-actions:focus-within {
+  opacity: 1;
+}
+
+.block[data-collapsed="true"] .block-body {
+  display: none;
 }
 
 .block-body {
@@ -183,6 +392,11 @@ body {
   max-width: 92%;
 }
 
+.block[data-kind="reasoning"] {
+  background: color-mix(in srgb, var(--bg-soft) 65%, transparent);
+  border-color: color-mix(in srgb, var(--border) 70%, transparent);
+}
+
 .block[data-kind="reasoning"] .block-body {
   color: var(--muted);
   font-style: italic;
@@ -200,11 +414,16 @@ body {
   overflow-wrap: anywhere;
 }
 
+.block[data-kind="tool"] .block-toggle .label {
+  font-family: var(--mono);
+}
+
 .block[data-kind="tool"][data-status="failed"] {
   border-color: var(--error);
 }
 
-.block[data-kind="tool"][data-status="failed"] .block-head .label {
+.block[data-kind="tool"][data-status="failed"] .block-head .label,
+.block[data-kind="tool"][data-status="failed"] .block-head .kind {
   color: var(--error);
 }
 
@@ -212,12 +431,14 @@ body {
   border-color: var(--error);
 }
 
+.block[data-kind="error"] .block-head,
 .block[data-kind="error"] .block-body {
   color: var(--error);
 }
 
-.block[data-streaming="true"] .block-head::after {
+.block[data-streaming="true"] .block-toggle::after {
   content: "";
+  flex: none;
   width: 0.45rem;
   height: 0.45rem;
   border-radius: 50%;
@@ -231,39 +452,152 @@ body {
   }
 }
 
-/* markdown */
+/* ------------------------------------------------------------- markdown */
 
+.block-body h1,
+.block-body h2,
+.block-body h3,
+.block-body h4,
+.block-body h5,
+.block-body h6 {
+  margin: 1.1em 0 0.5em;
+  line-height: 1.3;
+  font-weight: 600;
+}
+
+.block-body h1 {
+  font-size: 1.4em;
+}
+
+.block-body h2 {
+  font-size: 1.22em;
+}
+
+.block-body h3 {
+  font-size: 1.1em;
+}
+
+.block-body h4,
+.block-body h5,
+.block-body h6 {
+  font-size: 1em;
+}
+
+.block-body h5,
+.block-body h6 {
+  color: var(--muted);
+}
+
+.block-body p {
+  margin: 0.5em 0;
+}
+
+.block-body ul,
+.block-body ol {
+  margin: 0.5em 0;
+  padding-left: 1.4em;
+}
+
+.block-body li {
+  margin: 0.15em 0;
+}
+
+.block-body li > ul,
+.block-body li > ol {
+  margin: 0.15em 0;
+}
+
+.block-body li::marker {
+  color: var(--muted);
+}
+
+.block-body li.task {
+  list-style: none;
+}
+
+.block-body li.task input {
+  margin: 0 0.35em 0 0;
+  accent-color: var(--accent);
+  vertical-align: baseline;
+}
+
+.block-body hr {
+  height: 0;
+  margin: 0.9em 0;
+  border: 0;
+  border-top: 1px solid var(--border);
+}
+
+/* A code surface is a shade apart from the page it sits on, in both theme
+   types, so a fence reads as a panel rather than as a gap in the text. */
 .block-body pre {
+  margin: 0.7em 0;
   background: var(--code-bg);
+  border: 1px solid var(--border);
   border-radius: var(--radius);
-  padding: 0.6rem 0.7rem;
+  padding: 0.65rem 0.75rem;
   overflow-x: auto;
+  scrollbar-color: var(--scroll) transparent;
 }
 
 .block-body code {
-  font: 0.85em var(--mono);
+  font-family: var(--mono);
+  font-size: 0.875em;
 }
 
+.block-body pre code {
+  display: block;
+  padding: 0;
+  border: 0;
+  background: none;
+  white-space: pre;
+  line-height: 1.55;
+  tab-size: 4;
+}
+
+/* An inline span is a chip on a line of prose, so it is centered on that line
+   rather than hung off the baseline: a mono face carries more descent than the
+   text around it, which is what drags an unaligned chip low. The padding is
+   symmetric, the line box is the prose's own, and the half em of leading the
+   chip would otherwise add is taken back. */
 .block-body :not(pre) > code {
+  padding: 0.2em 0.4em;
+  border: 1px solid var(--border);
+  border-radius: 0.4em;
   background: var(--code-bg);
-  border-radius: 0.3rem;
-  padding: 0.05rem 0.3rem;
+  line-height: 1;
+  vertical-align: middle;
 }
 
 .block-body a {
   color: var(--link);
 }
 
+.block-body strong {
+  font-weight: 600;
+}
+
+.block-body del {
+  color: var(--muted);
+}
+
 .block-body blockquote {
-  margin: 0.5rem 0;
-  padding-left: 0.7rem;
+  margin: 0.6em 0;
+  padding: 0.05em 0 0.05em 0.7rem;
   border-left: 2px solid var(--border);
   color: var(--muted);
+}
+
+/* A wide table scrolls on its own instead of stretching the discussion. */
+.block-body .table-wrap {
+  margin: 0.6em 0;
+  overflow-x: auto;
 }
 
 .block-body table {
   border-collapse: collapse;
   width: 100%;
+  font-size: 0.92em;
 }
 
 .block-body th,
@@ -271,6 +605,11 @@ body {
   border: 1px solid var(--border);
   padding: 0.25rem 0.45rem;
   text-align: left;
+}
+
+.block-body th {
+  background: var(--bg-soft);
+  font-weight: 600;
 }
 
 .block-body img,
@@ -287,15 +626,25 @@ body {
 
 /* -------------------------------------------------------------- composer */
 
+/* The inset is the same on every side, so a button sits as far from the edge
+   of the bar as it does from the top of it. */
 .composer {
+  position: relative;
+  z-index: 1;
   border-top: 1px solid var(--border);
   background: var(--bg-soft);
-  padding: 0.5rem 0.75rem calc(0.5rem + env(safe-area-inset-bottom));
+  padding: 0.5rem 0.5rem calc(0.5rem + env(safe-area-inset-bottom));
+  transition: box-shadow 0.15s ease;
+}
+
+.app[data-under-foot="true"] .composer {
+  box-shadow: 0 -2px 3px -2px var(--shadow);
 }
 
 .attachments {
   display: flex;
   flex-wrap: wrap;
+  justify-content: center;
   gap: 0.35rem;
   padding-bottom: 0.4rem;
 }
@@ -305,7 +654,7 @@ body {
   align-items: center;
   gap: 0.35rem;
   max-width: 12rem;
-  padding: 0.15rem 0.45rem;
+  padding: 0.15rem 0.2rem 0.15rem 0.5rem;
   border-radius: 999px;
   background: var(--badge-bg);
   color: var(--badge-fg);
@@ -316,15 +665,6 @@ body {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-
-.chip button {
-  border: 0;
-  background: none;
-  color: inherit;
-  cursor: pointer;
-  padding: 0;
-  line-height: 1;
 }
 
 .hints {
@@ -363,69 +703,172 @@ body {
   white-space: nowrap;
 }
 
+/* The box takes every pixel the buttons do not, which puts the attachment
+   button against the left edge and send or stop against the right one. */
 .input-row {
   display: flex;
   align-items: flex-end;
-  gap: 0.4rem;
+  justify-content: space-between;
+  gap: 0.5rem;
+  width: 100%;
+  margin-inline: auto;
 }
 
 .input {
-  flex: 1;
+  flex: 1 1 auto;
   resize: none;
-  max-height: 9rem;
-  padding: 0.5rem 0.6rem;
+  max-height: var(--input-max);
+  /* One line of text plus this padding is exactly `--control`, so an empty box
+     is the same height as the buttons beside it and the row is even. */
+  min-height: var(--control);
+  padding: 0.4rem 0.6rem;
   border: 1px solid var(--input-border);
   border-radius: var(--radius);
   background: var(--input-bg);
   color: var(--input-fg);
   font: inherit;
+  line-height: 1.4;
+  overflow-y: auto;
+  scrollbar-color: var(--scroll) transparent;
 }
 
-.input:focus-visible,
-.icon-button:focus-visible {
-  outline: 2px solid var(--focus);
+/* A hairline of accent plus a soft ring — enough to place the caret, not the
+   heavy two pixel halo the default outline draws. */
+.input:focus,
+.input:focus-visible {
+  outline: none;
+  border-color: color-mix(in srgb, var(--focus) 55%, var(--input-border));
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--focus) 18%, transparent);
+}
+
+.button:focus-visible,
+.block-toggle:focus-visible {
+  outline: 1px solid color-mix(in srgb, var(--focus) 70%, transparent);
   outline-offset: 1px;
 }
 
-.icon-button {
-  display: grid;
-  place-items: center;
+/* --------------------------------------------------------------- buttons */
+
+/* One button, three intents. Inline flex with both axes centered keeps a
+   glyph, an icon or a word in the middle of the box whatever it holds. */
+.button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   flex: none;
-  width: 2.25rem;
-  height: 2.25rem;
+  width: var(--control);
+  height: var(--control);
+  padding: 0;
   border: 1px solid var(--input-border);
   border-radius: var(--radius);
   background: var(--input-bg);
   color: var(--fg);
-  font-size: 1rem;
+  font: inherit;
+  line-height: 1;
   cursor: pointer;
+  transition:
+    background 0.15s ease,
+    color 0.15s ease,
+    border-color 0.15s ease;
 }
 
-.icon-button.send {
-  background: var(--accent);
-  border-color: var(--accent);
-  color: var(--accent-fg);
+.button:hover {
+  border-color: color-mix(in srgb, var(--focus) 45%, var(--input-border));
 }
 
-.icon-button[disabled],
-.app[data-state="offline"] .icon-button {
+/* Every button on the composer is the same neutral coat — an outline, no
+   fill — so nothing on the bar shouts over the discussion above it. Stop is
+   the one exception, and only in the color of its icon. */
+.button.quiet {
+  background: none;
+  color: var(--muted);
+}
+
+.button.quiet:hover {
+  color: var(--fg);
+}
+
+.button.danger {
+  background: none;
+  color: var(--error);
+}
+
+.button.danger:hover {
+  color: var(--error);
+  border-color: color-mix(in srgb, var(--error) 55%, var(--input-border));
+}
+
+/* The size used inside a block head and on an attachment chip. */
+.button.tiny {
+  width: 1.35rem;
+  height: 1.35rem;
+  border: 0;
+  border-radius: 0.3rem;
+  background: none;
+  color: inherit;
+}
+
+.button.tiny:hover {
+  background: var(--bg-raised);
+  color: var(--fg);
+}
+
+.button[disabled],
+.app[data-state="offline"] .button,
+.app[data-state="connecting"] .button {
   opacity: 0.45;
   cursor: not-allowed;
 }
 
-.app[data-state="offline"] .input {
+.app[data-state="offline"] .input,
+.app[data-state="connecting"] .input {
   opacity: 0.45;
+}
+
+/* Stroke icons, sized from the box they sit in and colored by the text. */
+.icon {
+  display: block;
+  width: 1.05rem;
+  height: 1.05rem;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.button.tiny .icon,
+.chip .icon {
+  width: 0.85rem;
+  height: 0.85rem;
+  stroke-width: 2.25;
+}
+
+.block-toggle .icon {
+  stroke-width: 2.25;
 }
 
 @media (min-width: 40rem) {
   :root {
     --gap: 0.75rem;
+    --input-max: 14rem;
   }
 
   .discussion,
-  .composer,
   .bar {
     padding-left: 1rem;
     padding-right: 1rem;
+  }
+
+  .composer {
+    padding-left: 0.75rem;
+    padding-right: 0.75rem;
+    padding-top: 0.75rem;
+    padding-bottom: calc(0.75rem + env(safe-area-inset-bottom));
+  }
+
+  .block {
+    padding-left: 0.75rem;
+    padding-right: 0.75rem;
   }
 }
