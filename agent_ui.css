@@ -19,12 +19,13 @@
   --input-bg: #1b1f25;
   --input-fg: #e6ebf2;
   --input-border: #2a2f37;
-  --code-bg: #12151a;
+  --code-bg: #1c2028;
   --link: #6cb6ff;
   --error: #f2686c;
   --badge-bg: #2a2f37;
   --badge-fg: #d8dee9;
   --scroll: #333a44;
+  --shadow: rgba(0, 0, 0, 0.45);
 
   --gap: 0.625rem;
   --radius: 0.625rem;
@@ -53,12 +54,13 @@
   --input-bg: #ffffff;
   --input-fg: #24292f;
   --input-border: #d5d9de;
-  --code-bg: #f2f3f5;
+  --code-bg: #f1f3f6;
   --link: #0a58ca;
   --error: #c4373b;
   --badge-bg: #e3e6ea;
   --badge-fg: #24292f;
   --scroll: #c2c7ce;
+  --shadow: rgba(16, 24, 40, 0.14);
 }
 
 * {
@@ -107,13 +109,19 @@ body {
 
 /* ---------------------------------------------------------------- header */
 
+/* Both bars sit above the discussion and cast a short shadow onto it, so a
+   block scrolling under one reads as passing behind it rather than colliding
+   with it. They have to be stacked to paint over a later sibling. */
 .bar {
+  position: relative;
+  z-index: 1;
   display: flex;
   align-items: center;
   gap: var(--gap);
   padding: 0.5rem 0.75rem;
   border-bottom: 1px solid var(--border);
   background: var(--bg-soft);
+  box-shadow: 0 6px 14px -8px var(--shadow);
 }
 
 /* The mark is the title and the status light at once: connection and activity
@@ -515,29 +523,45 @@ body {
   border-top: 1px solid var(--border);
 }
 
+/* A code surface is a shade apart from the page it sits on, in both theme
+   types, so a fence reads as a panel rather than as a gap in the text. */
 .block-body pre {
-  margin: 0.6em 0;
+  margin: 0.7em 0;
   background: var(--code-bg);
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  padding: 0.6rem 0.7rem;
+  padding: 0.65rem 0.75rem;
   overflow-x: auto;
+  scrollbar-color: var(--scroll) transparent;
 }
 
 .block-body code {
-  font: 0.85em var(--mono);
+  font-family: var(--mono);
+  font-size: 0.875em;
 }
 
 .block-body pre code {
   display: block;
+  padding: 0;
+  border: 0;
+  background: none;
   white-space: pre;
-  line-height: 1.5;
+  line-height: 1.55;
+  tab-size: 4;
 }
 
+/* An inline span is a chip on a line of prose, so it is centered on that line
+   rather than hung off the baseline: a mono face carries more descent than the
+   text around it, which is what drags an unaligned chip low. The padding is
+   symmetric, the line box is the prose's own, and the half em of leading the
+   chip would otherwise add is taken back. */
 .block-body :not(pre) > code {
+  padding: 0.2em 0.4em;
+  border: 1px solid var(--border);
+  border-radius: 0.4em;
   background: var(--code-bg);
-  border-radius: 0.3rem;
-  padding: 0.05rem 0.3rem;
+  line-height: 1;
+  vertical-align: middle;
 }
 
 .block-body a {
@@ -598,9 +622,12 @@ body {
 /* -------------------------------------------------------------- composer */
 
 .composer {
+  position: relative;
+  z-index: 1;
   border-top: 1px solid var(--border);
   background: var(--bg-soft);
   padding: 0.5rem 0.75rem calc(0.5rem + env(safe-area-inset-bottom));
+  box-shadow: 0 -6px 14px -8px var(--shadow);
 }
 
 .attachments {
@@ -665,17 +692,19 @@ body {
   white-space: nowrap;
 }
 
+/* The box takes every pixel the buttons do not, which puts the attachment
+   button against the left edge and send or stop against the right one. */
 .input-row {
   display: flex;
   align-items: flex-end;
-  justify-content: center;
-  gap: 0.4rem;
+  justify-content: space-between;
+  gap: 0.5rem;
   width: 100%;
   margin-inline: auto;
 }
 
 .input {
-  flex: 1;
+  flex: 1 1 auto;
   resize: none;
   max-height: var(--input-max);
   min-height: var(--control);
@@ -734,17 +763,9 @@ body {
   border-color: color-mix(in srgb, var(--focus) 45%, var(--input-border));
 }
 
-.button.accent {
-  background: var(--accent);
-  border-color: var(--accent);
-  color: var(--accent-fg);
-}
-
-.button.danger {
-  color: var(--error);
-  border-color: color-mix(in srgb, var(--error) 55%, var(--input-border));
-}
-
+/* Every button on the composer is the same neutral coat — an outline, no
+   fill — so nothing on the bar shouts over the discussion above it. Stop is
+   the one exception, and only in the color of its icon. */
 .button.quiet {
   background: none;
   color: var(--muted);
@@ -752,6 +773,16 @@ body {
 
 .button.quiet:hover {
   color: var(--fg);
+}
+
+.button.danger {
+  background: none;
+  color: var(--error);
+}
+
+.button.danger:hover {
+  color: var(--error);
+  border-color: color-mix(in srgb, var(--error) 55%, var(--input-border));
 }
 
 /* The size used inside a block head and on an attachment chip. */

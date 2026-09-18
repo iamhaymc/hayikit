@@ -2129,6 +2129,22 @@ class ThemeTest(unittest.TestCase):
         self.assertNotIn("--accent", theme)
         self.assertNotIn("--muted", theme)
 
+    def test_a_code_surface_the_color_of_the_page_is_skipped(self):
+        path = self.write_theme(
+            colors={
+                "editor.background": "#101010",
+                "textCodeBlock.background": "#101010",
+                "editorWidget.background": "#202020",
+            }
+        )
+        self.assertEqual(A.load_vscode_theme(path)["--code-bg"], "#202020")
+
+    def test_a_code_surface_with_no_distinct_candidate_is_left_out(self):
+        path = self.write_theme(
+            colors={"editor.background": "#101010", "textCodeBlock.background": "#101010"}
+        )
+        self.assertNotIn("--code-bg", A.load_vscode_theme(path))
+
     def test_theme_types_are_normalised(self):
         for raw, expected in (
             ("light", "light"),

@@ -632,7 +632,11 @@ covers is left out entirely and the stylesheet keeps its own value.
 `theme_type()` folds the kinds VS Code writes (`light`, `hc`, `hcDark`,
 `hcLight`) onto the four the stylesheet knows, and the page carries the answer
 as `data-theme-type` on `<html>` — which is what swaps the default palette
-between dark and light.
+between dark and light. `THEME_DISTINCT` names the variables that are worthless
+unless they differ from the page background — `--code-bg` is the only one —
+so a theme that points `textCodeBlock.background` back at the editor background
+falls through to the next candidate, and to the stylesheet's own if none
+differs.
 
 ## 19. Web client
 
@@ -703,10 +707,23 @@ fallback palettes, one per theme type, because a VS Code theme names only part
 of the palette and the rest has to already match. Prompt blocks align right;
 tool and log blocks are monospaced and muted, a tool block keeps its whitespace
 and is labelled with the tool name (turning red when the call failed); a
-streaming block pulses. The composer centres its children, the box grows with
-the text it holds up to 14 rem and takes that height out of the discussion
-above it rather than covering it, and focus is a hairline of accent and a soft
-ring rather than a heavy halo.
+streaming block pulses.
+
+Code is a surface rather than a hole: a fence and an inline span both sit on
+`--code-bg`, a shade apart from the page in either theme type, inside a
+`--border` hairline. An inline span is centred on the line it interrupts
+(`vertical-align: middle`, its own line box collapsed to `1`), because a mono
+face carries more descent than the prose around it and hangs low when it is
+left on the baseline.
+
+Both bars are stacked above the discussion and cast a short shadow onto it, so
+a block scrolling under one passes behind it instead of colliding with it. On
+the composer the box takes every pixel the buttons do not, which puts the
+attachment button against the left edge and send or stop against the right;
+all three buttons wear the same neutral outline, and only the stop icon is
+coloured. The box grows with the text it holds up to 14 rem and takes that
+height out of the discussion above it rather than covering it, and focus is a
+hairline of accent and a soft ring rather than a heavy halo.
 
 ### Screenshots
 

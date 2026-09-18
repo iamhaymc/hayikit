@@ -414,6 +414,11 @@
     "--scroll": ["scrollbarSlider.background"],
   };
 
+  /** Variables worth nothing unless they differ from the page background: a
+   *  code surface the color of the page is not a surface. Mirrors
+   *  THEME_DISTINCT in agent.py. */
+  const THEME_DISTINCT = ["--code-bg"];
+
   const Theme = {
     /** Normalise the theme kinds VS Code writes onto the ones the CSS knows. */
     type(raw) {
@@ -445,10 +450,17 @@
     /** Map a raw VS Code theme file onto CSS variables (client side loading). */
     fromVsCode(theme) {
       const colors = (theme && theme.colors) || {};
+      const pick = (keys, unlike) => {
+        const key = keys.find(
+          (candidate) => colors[candidate] && String(colors[candidate]) !== unlike,
+        );
+        return key ? String(colors[key]) : null;
+      };
+      const background = pick(THEME_KEYS["--bg"]);
       const vars = {};
       Object.entries(THEME_KEYS).forEach(([name, keys]) => {
-        const key = keys.find((candidate) => colors[candidate]);
-        if (key) vars[name] = String(colors[key]);
+        const value = pick(keys, THEME_DISTINCT.includes(name) ? background : null);
+        if (value !== null) vars[name] = value;
       });
       vars["--theme-type"] = this.type(theme && theme.type);
       return vars;

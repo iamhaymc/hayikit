@@ -4241,6 +4241,12 @@ THEME_KEYS = {
     "--scroll": ("scrollbarSlider.background",),
 }
 
+#: Variables that are worthless unless they differ from the page background: a
+#: code surface the color of the page is not a surface. When every candidate a
+#: theme names is the background, the variable is left out and the stylesheet
+#: keeps its own, which is a shade apart by construction.
+THEME_DISTINCT = ("--code-bg",)
+
 #: The theme kinds VS Code writes, mapped onto the ones the stylesheet knows.
 THEME_TYPES = {
     "light": "light",
@@ -4272,12 +4278,20 @@ def load_vscode_theme(path: Path | str | None) -> dict[str, str]:
         return {}
     data = json.loads(Path(path).expanduser().read_text(encoding="utf-8"))
     colors = data.get("colors") or {}
+
+    def pick(keys: Iterable[str], unlike: str | None = None) -> str | None:
+        for key in keys:
+            value = colors.get(key)
+            if value and str(value) != unlike:
+                return str(value)
+        return None
+
+    background = pick(THEME_KEYS["--bg"])
     theme: dict[str, str] = {}
     for css, keys in THEME_KEYS.items():
-        for key in keys:
-            if colors.get(key):
-                theme[css] = str(colors[key])
-                break
+        value = pick(keys, background if css in THEME_DISTINCT else None)
+        if value is not None:
+            theme[css] = value
     theme["--theme-type"] = theme_type(data.get("type"))
     return theme
 

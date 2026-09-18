@@ -490,6 +490,22 @@ without losing what the model actually said. Clipboard writes fall back to a
 hidden selection where the async API is barred, which is every deployment not on
 `localhost` or TLS.
 
+**Nothing on the chrome competes with the discussion.** A filled accent button
+on the composer is the brightest thing on the page, and it sits next to the one
+region the reader is actually reading. Every composer button now wears the same
+neutral outline and only the stop icon carries a colour, the two bars cast a
+short shadow onto the discussion so a block scrolling under one reads as going
+behind it, and the box between the buttons takes all the width they leave.
+
+**Code has to be a surface, not a hole.** `--code-bg` was within two points of
+`--bg` in the dark palette, so a fence read as a gap in the text rather than as
+a panel. Both palettes now put a clear step between them, a hairline border
+draws the edge, and — because a theme is free to point `textCodeBlock.background`
+straight back at the editor background — a candidate equal to the page
+background is skipped rather than used. An inline span is centred on the line it
+interrupts instead of hung off the baseline: a mono face carries more descent
+than the prose around it, which is what drags an unaligned chip low.
+
 **Rendering is coalesced onto a frame.** Re-parsing the whole markdown of a
 block on every delta is quadratic and, at the rate a provider emits tokens,
 spends more time rendering than painting. `append` marks the body dirty and the
