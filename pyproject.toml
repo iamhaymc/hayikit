@@ -1,7 +1,7 @@
 [project]
 name = "agent"
 version = "0.1.0"
-description = "An application agnostic agent harness library"
+description = "Yet another agent harness"
 requires-python = ">=3.12"
 dependencies = [
     "openai",
@@ -12,8 +12,12 @@ dependencies = [
     "cachetools",
     "transformers @ git+https://github.com/huggingface/transformers",
     "accelerate",
-    "pillow"
+    "pillow",
+    "lighteval"
 ]
+
+[project.optional-dependencies]
+e2e = ["playwright"]
 
 [project.scripts]
 agent = "agent:main"

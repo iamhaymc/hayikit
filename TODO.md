@@ -34,10 +34,11 @@ is recorded here: the reasoning behind what exists is in
       deployment can see what the harness is doing.
 
 - [ ] **Tests for the web layer and the client.** The unit tests stop at the
-      protocol codec: the hub handlers, attachment limits, cancellation,
-      reconnection and every line of `agent_ui.js` are untested, which is most
-      of the surface a user actually touches. Add server tests over a real
-      websocket and a browser test that drives the page against a stub agent.
+      protocol codec and `agent_e2e.py` only photographs a happy path: the hub
+      handlers, attachment limits, cancellation, reconnection and most of
+      `agent_ui.js` are still unasserted, which is most of the surface a user
+      actually touches. Add server tests over a real websocket, and assertions
+      (plus cancellation, errors and reconnection) to the browser pass.
 
 - [ ] **Repl ergonomics.** The terminal reads plain lines: there is no history
       across restarts, no editing beyond what the platform's `input()` gives,

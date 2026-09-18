@@ -4188,43 +4188,111 @@ def _quietly(action: Callable[..., Any], *args: Any) -> None:
 # socket.io) that streams block events to connected clients.
 # ---------------------------------------------------------------------------
 
-#: Subset of the VS Code theme spec understood by the client.
+#: CSS variable to the VS Code colors it is taken from, best first. A theme
+#: names whatever it likes, so each variable keeps a list of fallbacks and the
+#: client stays on its own default for anything the file never mentions. The
+#: same table lives in `agent_ui.js` for themes loaded in the browser.
 THEME_KEYS = {
-    "editor.background": "--bg",
-    "editor.foreground": "--fg",
-    "sideBar.background": "--bg-soft",
-    "editorWidget.background": "--bg-raised",
-    "input.background": "--input-bg",
-    "input.foreground": "--input-fg",
-    "input.border": "--input-border",
-    "button.background": "--accent",
-    "button.foreground": "--accent-fg",
-    "focusBorder": "--focus",
-    "panel.border": "--border",
-    "descriptionForeground": "--muted",
-    "errorForeground": "--error",
-    "textLink.foreground": "--link",
-    "textCodeBlock.background": "--code-bg",
-    "badge.background": "--badge-bg",
-    "badge.foreground": "--badge-fg",
-    "scrollbarSlider.background": "--scroll",
+    "--bg": ("editor.background",),
+    "--fg": ("editor.foreground", "foreground"),
+    "--bg-soft": (
+        "sideBar.background",
+        "editorGroupHeader.tabsBackground",
+        "activityBar.background",
+    ),
+    "--bg-raised": (
+        "editorWidget.background",
+        "dropdown.background",
+        "menu.background",
+        "input.background",
+    ),
+    "--input-bg": ("input.background", "editorWidget.background"),
+    "--input-fg": ("input.foreground", "editor.foreground", "foreground"),
+    "--input-border": (
+        "input.border",
+        "editorWidget.border",
+        "panel.border",
+        "contrastBorder",
+    ),
+    "--border": (
+        "panel.border",
+        "editorGroup.border",
+        "editorWidget.border",
+        "contrastBorder",
+        "input.border",
+    ),
+    "--accent": ("button.background", "focusBorder"),
+    "--accent-fg": ("button.foreground",),
+    "--focus": ("focusBorder", "button.background"),
+    "--muted": (
+        "descriptionForeground",
+        "editorLineNumber.foreground",
+        "disabledForeground",
+    ),
+    "--error": (
+        "errorForeground",
+        "editorError.foreground",
+        "inputValidation.errorBorder",
+    ),
+    "--link": ("textLink.foreground", "textLink.activeForeground"),
+    "--code-bg": ("textCodeBlock.background", "editorWidget.background"),
+    "--badge-bg": ("badge.background",),
+    "--badge-fg": ("badge.foreground",),
+    "--scroll": ("scrollbarSlider.background",),
+}
+
+#: Variables that are worthless unless they differ from the page background: a
+#: code surface the color of the page is not a surface. When every candidate a
+#: theme names is the background, the variable is left out and the stylesheet
+#: keeps its own, which is a shade apart by construction.
+THEME_DISTINCT = ("--code-bg",)
+
+#: The theme kinds VS Code writes, mapped onto the ones the stylesheet knows.
+THEME_TYPES = {
+    "light": "light",
+    "hc": "hc-dark",
+    "hcdark": "hc-dark",
+    "hc-dark": "hc-dark",
+    "hclight": "hc-light",
+    "hc-light": "hc-light",
 }
 
 MAX_ATTACHMENT_BYTES = 8 * 1024 * 1024
 MAX_MESSAGE_BYTES = 16 * 1024 * 1024
 
 
+def theme_type(raw: Any) -> str:
+    """Normalise a VS Code theme kind. Anything unknown is treated as dark."""
+    value = re.sub(r"[\s_]+", "-", str(raw or "").strip().lower())
+    return THEME_TYPES.get(value, "dark")
+
+
 def load_vscode_theme(path: Path | str | None) -> dict[str, str]:
-    """Map a VS Code theme file onto the CSS variables the client understands."""
+    """Map a VS Code theme file onto the CSS variables the client understands.
+
+    Each variable takes the first color the file actually defines out of its
+    candidates, so a theme that names only half the palette still reads as
+    itself; the rest stays on the stylesheet default for its theme type.
+    """
     if not path:
         return {}
     data = json.loads(Path(path).expanduser().read_text(encoding="utf-8"))
     colors = data.get("colors") or {}
-    theme = {
-        css: str(colors[key]) for key, css in THEME_KEYS.items() if colors.get(key)
-    }
-    if data.get("type"):
-        theme["--theme-type"] = str(data["type"])
+
+    def pick(keys: Iterable[str], unlike: str | None = None) -> str | None:
+        for key in keys:
+            value = colors.get(key)
+            if value and str(value) != unlike:
+                return str(value)
+        return None
+
+    background = pick(THEME_KEYS["--bg"])
+    theme: dict[str, str] = {}
+    for css, keys in THEME_KEYS.items():
+        value = pick(keys, background if css in THEME_DISTINCT else None)
+        if value is not None:
+            theme[css] = value
+    theme["--theme-type"] = theme_type(data.get("type"))
     return theme
 
 
@@ -4551,16 +4619,30 @@ class WebServer:
             if not file.is_file():
                 return connection.respond(404, "Not Found")
             response = connection.respond(200, file.read_text(encoding="utf-8"))
-            response.headers["Content-Type"] = content_type
+            self.retype(response, content_type)
             response.headers["Cache-Control"] = "no-cache"
             return response
         rest = self.rest(path)
         if rest is not None:
             status, body = rest
             response = connection.respond(status, body)
-            response.headers["Content-Type"] = "application/json"
+            self.retype(response, "application/json")
             return response
         return connection.respond(404, "Not Found")
+
+    @staticmethod
+    def retype(response: Any, content_type: str) -> Any:
+        """Set the content type of a response, replacing the one it was built with.
+
+        The header map appends rather than overwrites, so assigning on top of
+        the ``text/plain`` the transport picked would send two content types and
+        the browser would believe the first — which is how a stylesheet ends up
+        ignored.
+        """
+        with contextlib.suppress(KeyError):
+            del response.headers["Content-Type"]
+        response.headers["Content-Type"] = content_type
+        return response
 
     async def serve(self) -> None:
         """Serve until cancelled."""

@@ -457,9 +457,91 @@ audio are recognized by extension or data URL and rendered inline.
 
 The UI is mobile first, centred, and shrinks content before wrapping it. It
 disables itself while disconnected and reconnects with exponential backoff, so a
-dropped socket degrades visibly instead of silently swallowing input. Theming
-reads a subset of the VS Code theme spec and maps it onto CSS custom properties,
-which gives the whole UI a palette from a file the user already has.
+dropped socket degrades visibly instead of silently swallowing input.
+
+**One mark says everything about state.** The page used to carry a word for a
+title, a second word for the connection and a coloured dot beside it — three
+things saying what one shape can. Now a single SVG in the top left is the title
+and the status light: its colour, its ring and its motion carry connecting,
+connected, working and disconnected. Status that lives in the icon cannot drift
+out of sync with the icon, costs no width on a phone, and reads before it is
+read. The words stay for a screen reader and in the tooltip, because a shape is
+not an accessible name.
+
+**Theming has to survive a theme that names half a palette.** A VS Code theme
+defines whatever colours its author cared about, so mapping one key to one
+variable left the rest on the built-in dark values — which is how a light theme
+used to produce light panels with dark everything else. Two things fix it: each
+variable now takes the first of several candidate keys the file actually
+defines, and the stylesheet carries a complete fallback palette per theme type,
+switched by `data-theme-type` on `<html>`. A theme sets what it knows; the rest
+already matches.
+
+**Icons are inline with the code.** A modern icon pack as a dependency means a
+font, a build step or a network fetch for a page whose whole point is that it is
+three static files. The set is a table of SVG path strings: it inherits
+`currentColor`, scales with the box it sits in, themes itself for free, and adds
+nothing to load.
+
+**A block is a container, not a paragraph.** Every block has a head that
+collapses it (chevron, kind icon, label) and a button group that copies its
+text, so a long tool transcript or a long reasoning pass can be folded away
+without losing what the model actually said. Clipboard writes fall back to a
+hidden selection where the async API is barred, which is every deployment not on
+`localhost` or TLS.
+
+**Nothing on the chrome competes with the discussion.** A filled accent button
+on the composer is the brightest thing on the page, and it sits next to the one
+region the reader is actually reading. Every composer button now wears the same
+neutral outline and only the stop icon carries a colour, and the box between
+the buttons takes all the width they leave, inset by the same amount on every
+side.
+
+A bar shadow is a depth cue, and a cue that is always on says nothing. Each bar
+casts a hairline only while there is content under that edge — the client
+watches the discussion and writes `data-under-head` and `data-under-foot` — so
+a conversation that fits on the screen sits on a flat page and the shadow
+appears exactly when something is passing behind.
+
+**Code has to be a surface, not a hole.** `--code-bg` was within two points of
+`--bg` in the dark palette, so a fence read as a gap in the text rather than as
+a panel. Both palettes now put a clear step between them, a hairline border
+draws the edge, and — because a theme is free to point `textCodeBlock.background`
+straight back at the editor background — a candidate equal to the page
+background is skipped rather than used. An inline span is centred on the line it
+interrupts instead of hung off the baseline: a mono face carries more descent
+than the prose around it, which is what drags an unaligned chip low.
+
+**Rendering is coalesced onto a frame.** Re-parsing the whole markdown of a
+block on every delta is quadratic and, at the rate a provider emits tokens,
+spends more time rendering than painting. `append` marks the body dirty and the
+paint happens on the next animation frame, so the cost is one render per frame
+regardless of token rate and the text still appears as it arrives.
+
+## End to end capture
+
+`agent_e2e.py` exists because the page was the one subsystem nothing looked at.
+Every other part is asserted by `agent_test.py`, while the client was only ever
+checked by a person opening a browser — so the two defects below sat in plain
+sight.
+
+It serves the real web layer on a background thread and drives it with
+Playwright, replacing only the three seams that reach a provider
+(`build_tools`, `build_sdk_agent`, `stream`); sessions, memory, the event bridge,
+the hub, the markup, the styles and the client are all the shipped ones, so a
+capture is a test of the page rather than of a mock of it. The scripted run parks
+itself in the middle of its answer until the capture releases it, because the
+alternative — sleeping and hoping — photographs a different frame every time.
+Nine images (three moments across a desktop, a phone in portrait and a phone in
+landscape) are written to `assets/` and shown in [`GUIDE.md`](GUIDE.md), which
+makes a layout regression something a reader can see in a diff.
+
+The scripted run publishes a reasoning block before it calls its tool, so the
+capture covers the three kinds of block the page draws rather than two, and the
+middle moment is asserted as well as photographed: the reasoning must be on the
+page and the answer must be there *and* incomplete. A client that buffered a
+block until it ended would still take a plausible looking screenshot; it would
+not pass that assertion.
 
 ## Consumer port: storynu
 
@@ -521,6 +603,9 @@ harness.
     and YAML file layer between the defaults and the environment
     (`find_config_file`, `read_config_file`, `AgentConfig.with_file`), and a
     template that the config file can name.
+27. End to end capture: `agent_e2e.py`, a scripted agent behind the real server,
+    a Playwright pass over desktop and phone viewports, and the screenshots in
+    `assets/` that `GUIDE.md` shows.
 
 ## Fixes worth remembering
 
@@ -555,3 +640,13 @@ harness.
   and a local Ollama could not be reached over a credential it never asks for.
   An empty key now falls back to a placeholder, with a set `OPENAI_API_KEY`
   still winning.
+- **Two content types on every asset.** The response header map appends rather
+  than overwrites, so setting `Content-Type` on top of the `text/plain` the
+  transport had already written sent both — and the browser believed the first.
+  The stylesheet was fetched and ignored on every load, and the page had been
+  rendering unstyled since the web layer was written. `WebServer.retype()` now
+  clears the header before setting it.
+- **A hidden button that stayed on screen.** `.icon-button { display: grid }`
+  outranks the browser rule behind the `hidden` attribute, so hiding send and
+  showing stop did neither: both sat in the composer through every run. A single
+  `[hidden] { display: none !important }` rule restores the attribute.

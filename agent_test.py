@@ -2106,6 +2106,57 @@ class ThemeTest(unittest.TestCase):
     def test_missing_theme_is_empty(self):
         self.assertEqual(A.load_vscode_theme(None), {})
 
+    def write_theme(self, **data) -> Path:
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        path = tmp / "theme.json"
+        path.write_text(json.dumps(data), encoding="utf-8")
+        return path
+
+    def test_a_variable_falls_back_to_the_next_color_the_theme_names(self):
+        path = self.write_theme(
+            colors={
+                "editorGroupHeader.tabsBackground": "#202020",
+                "editorWidget.border": "#303030",
+            }
+        )
+        theme = A.load_vscode_theme(path)
+        self.assertEqual(theme["--bg-soft"], "#202020")
+        self.assertEqual(theme["--border"], "#303030")
+
+    def test_a_variable_no_color_covers_is_left_to_the_stylesheet(self):
+        theme = A.load_vscode_theme(self.write_theme(colors={"editor.background": "#101010"}))
+        self.assertNotIn("--accent", theme)
+        self.assertNotIn("--muted", theme)
+
+    def test_a_code_surface_the_color_of_the_page_is_skipped(self):
+        path = self.write_theme(
+            colors={
+                "editor.background": "#101010",
+                "textCodeBlock.background": "#101010",
+                "editorWidget.background": "#202020",
+            }
+        )
+        self.assertEqual(A.load_vscode_theme(path)["--code-bg"], "#202020")
+
+    def test_a_code_surface_with_no_distinct_candidate_is_left_out(self):
+        path = self.write_theme(
+            colors={"editor.background": "#101010", "textCodeBlock.background": "#101010"}
+        )
+        self.assertNotIn("--code-bg", A.load_vscode_theme(path))
+
+    def test_theme_types_are_normalised(self):
+        for raw, expected in (
+            ("light", "light"),
+            ("hcDark", "hc-dark"),
+            ("hc", "hc-dark"),
+            ("hcLight", "hc-light"),
+            ("dark", "dark"),
+            (None, "dark"),
+            ("nonsense", "dark"),
+        ):
+            self.assertEqual(A.theme_type(raw), expected, raw)
+
 
 class HubTest(unittest.TestCase):
     class FakeSocket:
@@ -2207,6 +2258,85 @@ class WebServerTest(unittest.TestCase):
         self.assertEqual(A.safe_name("../../etc/passwd"), "passwd")
         self.assertEqual(A.safe_name(""), "file")
         self.assertEqual(A.safe_name("a b?c.txt"), "a_b_c.txt")
+
+    def test_content_type_replaces_the_one_the_transport_set(self):
+        from websockets.datastructures import Headers
+
+        response = types.SimpleNamespace(headers=Headers())
+        response.headers["Content-Type"] = "text/plain; charset=utf-8"
+        A.WebServer.retype(response, "text/css; charset=utf-8")
+        self.assertEqual(
+            response.headers.get_all("Content-Type"), ["text/css; charset=utf-8"]
+        )
+
+
+class E2eCaptureTest(unittest.TestCase):
+    """The scripted agent behind `agent_e2e.py`, without a browser."""
+
+    def setUp(self):
+        import agent_e2e as E
+
+        self.E = E
+        self.gate = E.Gate()
+        self.agent = E.ScriptedAgent(
+            console=False,
+            env=False,
+            config_file=False,
+            gate=self.gate,
+            pace=0.0,
+            store=A.MemoryStore(),
+        )
+        self.addCleanup(self.agent.close)
+
+    def test_chunks_rebuild_the_text_they_came_from(self):
+        text = self.E.ANSWER_HEAD + self.E.ANSWER_TAIL
+        self.assertEqual("".join(self.E.chunks(text)), text)
+
+    def test_the_run_holds_until_the_capture_releases_it(self):
+        seen = []
+        self.agent.events.on(
+            A.EventType.ALL,
+            lambda event: seen.append((event.type, str(event.data.get("id", "")))),
+        )
+
+        async def drive():
+            task = asyncio.ensure_future(self.agent.run("{{ config.input }}", input=self.E.PROMPT))
+            while not self.gate.reached.is_set():
+                await asyncio.sleep(0.01)
+            held = list(seen)
+            self.gate.release()
+            return held, await task
+
+        held, result = run(drive())
+        types = [event for event, _id in held]
+        ended = [id for event, id in held if event == A.EventType.BLOCK_END]
+        self.assertIn(A.EventType.TOOL_END, types)
+        # Reasoning and the tool call are behind the gate; the answer is not:
+        # it is half written, which is what the middle frame photographs.
+        self.assertTrue(any(id.endswith("-reasoning") for id in ended))
+        self.assertFalse(any(id.endswith("-answer") for id in ended))
+        self.assertTrue(result.ok)
+        self.assertEqual(result.output, self.E.ANSWER_HEAD + self.E.ANSWER_TAIL)
+        self.assertEqual([call.name for call in result.tools], [self.E.TOOL_NAME])
+
+    def test_the_reasoning_is_streamed_before_the_answer(self):
+        """The page can only show a reason block if the run publishes one."""
+        seen = []
+        self.agent.events.on(
+            A.EventType.BLOCK_START,
+            lambda event: seen.append(str(event.data.get("kind", ""))),
+        )
+
+        async def drive():
+            task = asyncio.ensure_future(self.agent.run("{{ config.input }}", input=self.E.PROMPT))
+            while not self.gate.reached.is_set():
+                await asyncio.sleep(0.01)
+            self.gate.release()
+            return await task
+
+        result = run(drive())
+        self.assertEqual(seen, ["reasoning", "output"])
+        self.assertEqual(result.text_of("reasoning"), self.E.REASONING)
 
 
 class ConfigFileTest(unittest.TestCase):
