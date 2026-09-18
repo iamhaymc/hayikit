@@ -9,12 +9,18 @@
     <link rel="stylesheet" href="/agent_ui.css" />
   </head>
   <body>
-    <div class="app" id="app" data-state="offline">
+    <div class="app" id="app" data-state="connecting">
       <header class="bar">
-        <span class="brand" id="brand">agent</span>
-        <span class="status" id="status" title="Connection status">
-          <i class="dot"></i><span id="status-text">connecting</span>
+        <!-- The mark is the only status light: its ring, its core and its
+             motion all change with the connection and with a live run. -->
+        <span class="brand" id="brand" role="img" aria-label="agent, connecting" title="agent — connecting">
+          <svg class="mark" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+            <circle class="mark-halo" cx="12" cy="12" r="10.5" />
+            <circle class="mark-ring" cx="12" cy="12" r="7.75" />
+            <path class="mark-core" d="M12 6.4 15.1 12 12 17.6 8.9 12Z" />
+          </svg>
         </span>
+        <span class="sr-only" id="status-text" role="status">connecting</span>
         <span class="session" id="session" title="Active session"></span>
       </header>
 
@@ -28,9 +34,13 @@
         <div class="attachments" id="attachments" hidden></div>
         <div class="hints" id="hints" hidden></div>
         <form class="input-row" id="form" autocomplete="off">
-          <label class="icon-button" for="file" title="Attach files">
+          <label class="button quiet" for="file" title="Attach files" aria-label="Attach files">
             <input type="file" id="file" multiple hidden />
-            <span aria-hidden="true">+</span>
+            <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+              <path
+                d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57A4 4 0 1 1 18 8.84l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48"
+              />
+            </svg>
           </label>
           <textarea
             id="input"
@@ -39,11 +49,16 @@
             placeholder="Message the agent…"
             disabled
           ></textarea>
-          <button class="icon-button send" id="send" type="submit" title="Send" disabled>
-            <span aria-hidden="true">&rarr;</span>
+          <button class="button accent" id="send" type="submit" title="Send" aria-label="Send" disabled>
+            <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+              <path d="M12 19V5" />
+              <path d="m5 12 7-7 7 7" />
+            </svg>
           </button>
-          <button class="icon-button stop" id="stop" type="button" title="Stop" hidden>
-            <span aria-hidden="true">&#9632;</span>
+          <button class="button danger" id="stop" type="button" title="Stop" aria-label="Stop" hidden>
+            <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+              <rect x="6.5" y="6.5" width="11" height="11" rx="2.5" fill="currentColor" stroke="none" />
+            </svg>
           </button>
         </form>
       </footer>

@@ -457,9 +457,44 @@ audio are recognized by extension or data URL and rendered inline.
 
 The UI is mobile first, centred, and shrinks content before wrapping it. It
 disables itself while disconnected and reconnects with exponential backoff, so a
-dropped socket degrades visibly instead of silently swallowing input. Theming
-reads a subset of the VS Code theme spec and maps it onto CSS custom properties,
-which gives the whole UI a palette from a file the user already has.
+dropped socket degrades visibly instead of silently swallowing input.
+
+**One mark says everything about state.** The page used to carry a word for a
+title, a second word for the connection and a coloured dot beside it — three
+things saying what one shape can. Now a single SVG in the top left is the title
+and the status light: its colour, its ring and its motion carry connecting,
+connected, working and disconnected. Status that lives in the icon cannot drift
+out of sync with the icon, costs no width on a phone, and reads before it is
+read. The words stay for a screen reader and in the tooltip, because a shape is
+not an accessible name.
+
+**Theming has to survive a theme that names half a palette.** A VS Code theme
+defines whatever colours its author cared about, so mapping one key to one
+variable left the rest on the built-in dark values — which is how a light theme
+used to produce light panels with dark everything else. Two things fix it: each
+variable now takes the first of several candidate keys the file actually
+defines, and the stylesheet carries a complete fallback palette per theme type,
+switched by `data-theme-type` on `<html>`. A theme sets what it knows; the rest
+already matches.
+
+**Icons are inline with the code.** A modern icon pack as a dependency means a
+font, a build step or a network fetch for a page whose whole point is that it is
+three static files. The set is a table of SVG path strings: it inherits
+`currentColor`, scales with the box it sits in, themes itself for free, and adds
+nothing to load.
+
+**A block is a container, not a paragraph.** Every block has a head that
+collapses it (chevron, kind icon, label) and a button group that copies its
+text, so a long tool transcript or a long reasoning pass can be folded away
+without losing what the model actually said. Clipboard writes fall back to a
+hidden selection where the async API is barred, which is every deployment not on
+`localhost` or TLS.
+
+**Rendering is coalesced onto a frame.** Re-parsing the whole markdown of a
+block on every delta is quadratic and, at the rate a provider emits tokens,
+spends more time rendering than painting. `append` marks the body dirty and the
+paint happens on the next animation frame, so the cost is one render per frame
+regardless of token rate and the text still appears as it arrives.
 
 ## End to end capture
 
@@ -478,6 +513,13 @@ alternative — sleeping and hoping — photographs a different frame every time
 Nine images (three moments across a desktop, a phone in portrait and a phone in
 landscape) are written to `assets/` and shown in [`GUIDE.md`](GUIDE.md), which
 makes a layout regression something a reader can see in a diff.
+
+The scripted run publishes a reasoning block before it calls its tool, so the
+capture covers the three kinds of block the page draws rather than two, and the
+middle moment is asserted as well as photographed: the reasoning must be on the
+page and the answer must be there *and* incomplete. A client that buffered a
+block until it ended would still take a plausible looking screenshot; it would
+not pass that assertion.
 
 ## Consumer port: storynu
 

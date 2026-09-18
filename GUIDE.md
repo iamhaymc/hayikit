@@ -622,28 +622,51 @@ Attachments are decoded from their data URLs, capped (8 MiB per prompt, 16 MiB
 per websocket message), written under `attachments/` in the session workspace
 with sanitized names and passed to the run as `extras["attachments"]`.
 
-`load_vscode_theme()` maps a subset of the VS Code theme spec (`THEME_KEYS`)
-onto the CSS custom properties the page uses, and the result is served at
-`/api/theme` and sent in the `hello` message.
+`load_vscode_theme()` maps a subset of the VS Code theme spec onto the CSS
+custom properties the page uses, and the result is served at `/api/theme` and
+sent in the `hello` message. `THEME_KEYS` gives every variable a list of colors
+rather than one, best first: `--bg-soft` takes `sideBar.background`, then
+`editorGroupHeader.tabsBackground`, then `activityBar.background`, so a theme
+that names only part of the palette still reads as itself. What no candidate
+covers is left out entirely and the stylesheet keeps its own value.
+`theme_type()` folds the kinds VS Code writes (`light`, `hc`, `hcDark`,
+`hcLight`) onto the four the stylesheet knows, and the page carries the answer
+as `data-theme-type` on `<html>` — which is what swaps the default palette
+between dark and light.
 
 ## 19. Web client
 
-`agent_ui.js` is six small subsystems over one socket:
+`agent_ui.js` is eight small subsystems over one socket, exposed on
+`window.agentUI` so a console or a test harness can reach them without one:
 
-- **Markdown** — escapes the text first (`&`, `<`, `>`, `"`, `'`), then parses
-  headings, fences, quotes, rules and lists line by line and applies inline
-  code, emphasis, links and images. URLs are allow-listed (`http(s):`, `mailto:`,
-  relative paths, and `data:` for image/video/audio only), so model output can
-  never inject markup or a script URL.
+- **Icons** — a stroke icon set written inline with the code: no font, no
+  network, no build step. `Icons.markup(name)` returns a 24×24 `<svg>` that
+  takes its colour from the text around it and its size from the box it sits
+  in. Buttons carry an icon instead of a glyph, and each block kind has one
+  (prompt, output, reasoning, tool, log, error).
+- **Markdown** — lifts code spans out first so nothing rewrites what is inside
+  them, escapes the rest (`&`, `<`, `>`, `"`, `'`), then parses headings,
+  fences with a language, quotes, rules, pipe tables with alignment and nested
+  ordered, unordered and task lists, and applies inline code, emphasis,
+  strikethrough, links and images. URLs are allow-listed (`http(s):`,
+  `mailto:`, relative paths, and `data:` for image/video/audio only), so model
+  output can never inject markup or a script URL.
 - **Media** — recognizes images, video and audio by extension or data URL and
   emits `<img loading="lazy">`, `<video controls playsinline>` or
   `<audio controls>`.
+- **Clipboard** — `writeText` where the page is allowed it, a hidden selection
+  and `execCommand` where it is not, which is what the copy button on a block
+  uses over plain http.
 - **Blocks** — `Blocks.ensure(id, kind, role)` creates a block on first sight and
   returns it thereafter, so `block.delta` messages may arrive interleaved and out
-  of order. `append`, `set` and `end` re-render the body; the view auto-scrolls
-  only when the reader is already near the bottom. A `tool` block is labelled with the tool
-  name, rendered as text rather than markdown, and marked `data-status="failed"`
-  when the call did not succeed.
+  of order. `append` and `set` mark the body dirty and paint it on the next
+  animation frame, so a hundred tokens a second cost one render a frame rather
+  than a render a token; `end` paints immediately. The view auto-scrolls only
+  when the reader is already near the bottom. Every block has a head that
+  collapses it — a chevron, its kind icon, its label — and a button group with
+  copy. A `tool` block is labelled with the tool name, rendered as text rather
+  than markdown, and marked `data-status="failed"` when the call did not
+  succeed.
 - **Commands** — merges the server list from `hello` with the local `/clear` and
   `/theme`, and drives the hint list (filter as you type, arrows to move,
   Tab/Enter to select).
@@ -651,16 +674,39 @@ onto the CSS custom properties the page uses, and the result is served at
   sent with the next prompt.
 - **Socket** — connects to `/ws`, says `hello` with the current session, routes
   server messages, and reconnects with exponential backoff (250 ms doubling to
-  8 s) while the composer disables itself and the status shows the state. The
-  `history` of the `hello` reply is replayed into the discussion, replacing what
-  is shown, so a reload or a reconnect restores the conversation.
+  8 s) while the composer disables itself. The `history` of the `hello` reply is
+  replayed into the discussion, replacing what is shown, so a reload or a
+  reconnect restores the conversation.
+
+`Theme.fromVsCode()` is the same table as `THEME_KEYS` on the server, for a
+theme the reader loads themselves with `/theme`, and `Theme.apply()` writes the
+variables onto `<html>` and the theme type onto `data-theme-type`.
+
+### The mark
+
+The page has no title text and no status light. One SVG in the top left is
+both, and every state is that same mark modulated:
+
+- **connecting** — a muted ring with a gap chasing itself around it.
+- **connected** — a whole ring and a solid core, in the accent colour.
+- **working** — the ring turns and a halo breathes around it while a run is in
+  flight.
+- **disconnected** — a dotted ring and a hollow core, in the error colour.
+
+The words are still there for a screen reader (`#status-text`, and the mark's
+own label) and in its tooltip; the eye reads the shape.
 
 `agent_ui.css` is mobile first: a `100dvh` grid of header, scrolling discussion
 and composer, centred at `52rem`, with every colour taken from a CSS custom
-property so a theme can replace the palette wholesale. Prompt blocks align right;
+property so a theme can replace the palette wholesale. There are two complete
+fallback palettes, one per theme type, because a VS Code theme names only part
+of the palette and the rest has to already match. Prompt blocks align right;
 tool and log blocks are monospaced and muted, a tool block keeps its whitespace
 and is labelled with the tool name (turning red when the call failed); a
-streaming block pulses.
+streaming block pulses. The composer centres its children, the box grows with
+the text it holds up to 14 rem and takes that height out of the discussion
+above it rather than covering it, and focus is a hairline of accent and a soft
+ring rather than a heavy halo.
 
 ### Screenshots
 
@@ -675,9 +721,11 @@ playwright install chromium
 python agent_e2e.py
 ```
 
-Three moments are captured per device: after launch, during the request (half the
-answer written, the tool call closed, the stop button live) and after the
-response.
+Three moments are captured per device: after launch, during the request (the
+reasoning shown, the tool call closed, half the answer written, the stop button
+live) and after the response. The middle moment is asserted as well as
+photographed: the page must already show the reasoning and part of the answer,
+and only part, which is what proves tokens are painted as they arrive.
 
 Desktop, 1440×900:
 
