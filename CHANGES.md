@@ -493,9 +493,15 @@ hidden selection where the async API is barred, which is every deployment not on
 **Nothing on the chrome competes with the discussion.** A filled accent button
 on the composer is the brightest thing on the page, and it sits next to the one
 region the reader is actually reading. Every composer button now wears the same
-neutral outline and only the stop icon carries a colour, the two bars cast a
-short shadow onto the discussion so a block scrolling under one reads as going
-behind it, and the box between the buttons takes all the width they leave.
+neutral outline and only the stop icon carries a colour, and the box between
+the buttons takes all the width they leave, inset by the same amount on every
+side.
+
+A bar shadow is a depth cue, and a cue that is always on says nothing. Each bar
+casts a hairline only while there is content under that edge — the client
+watches the discussion and writes `data-under-head` and `data-under-foot` — so
+a conversation that fits on the screen sits on a flat page and the shadow
+appears exactly when something is passing behind.
 
 **Code has to be a surface, not a hole.** `--code-bg` was within two points of
 `--bg` in the dark palette, so a fence read as a gap in the text rather than as

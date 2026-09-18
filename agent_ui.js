@@ -469,6 +469,16 @@
 
   // ----------------------------------------------------------------- blocks
 
+  /** Report which edges of the discussion have content under them. A bar casts
+   *  a shadow only while something is passing behind it, so a conversation
+   *  that fits on the screen sits on a flat page. */
+  const edges = () => {
+    const view = el.discussion;
+    const room = view.scrollHeight - view.clientHeight;
+    el.app.dataset.underHead = String(view.scrollTop > 1);
+    el.app.dataset.underFoot = String(room - view.scrollTop > 1);
+  };
+
   /** A block subscribes to content and re-renders itself when it changes. */
   class Block {
     constructor(id, kind, role) {
@@ -514,6 +524,7 @@
       const collapsed = force === undefined ? this.node.dataset.collapsed !== "true" : force;
       this.node.dataset.collapsed = String(collapsed);
       this.toggle.setAttribute("aria-expanded", String(!collapsed));
+      edges();
     }
 
     async copy() {
@@ -580,11 +591,13 @@
       const near =
         el.discussion.scrollHeight - el.discussion.scrollTop - el.discussion.clientHeight;
       if (near < 160) el.discussion.scrollTop = el.discussion.scrollHeight;
+      edges();
     },
     clear() {
       this.map.clear();
       [...el.discussion.querySelectorAll(".block")].forEach((n) => n.remove());
       el.empty.hidden = false;
+      edges();
     },
     note(kind, text) {
       const block = this.ensure(`note-${Date.now()}-${Math.random()}`, kind, "system");
@@ -999,6 +1012,11 @@
 
   el.stop.addEventListener("click", () => Socket.send({ type: "cancel" }));
 
+  el.discussion.addEventListener("scroll", edges, { passive: true });
+  // The view shrinks when the composer grows, which moves both edges too.
+  if (window.ResizeObserver) new ResizeObserver(edges).observe(el.discussion);
+
+  edges();
   resize();
   Socket.connect();
 

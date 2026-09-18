@@ -716,12 +716,15 @@ Code is a surface rather than a hole: a fence and an inline span both sit on
 face carries more descent than the prose around it and hangs low when it is
 left on the baseline.
 
-Both bars are stacked above the discussion and cast a short shadow onto it, so
-a block scrolling under one passes behind it instead of colliding with it. On
-the composer the box takes every pixel the buttons do not, which puts the
-attachment button against the left edge and send or stop against the right;
-all three buttons wear the same neutral outline, and only the stop icon is
-coloured. The box grows with the text it holds up to 14 rem and takes that
+Both bars are stacked above the discussion, and each casts a hairline of
+shadow onto it only while there is something under that edge to pass behind:
+the client watches the discussion and writes `data-under-head` and
+`data-under-foot` onto the app, so a conversation that fits on the screen sits
+on a flat page. On the composer the box takes every pixel the buttons do not,
+which puts the attachment button against the left edge and send or stop against
+the right; the inset is the same on every side, an empty box is exactly as tall
+as the buttons beside it, and all three buttons wear the same neutral outline
+with only the stop icon coloured. The box grows with the text it holds up to 14 rem and takes that
 height out of the discussion above it rather than covering it, and focus is a
 hairline of accent and a soft ring rather than a heavy halo.
 

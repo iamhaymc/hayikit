@@ -25,7 +25,7 @@
   --badge-bg: #2a2f37;
   --badge-fg: #d8dee9;
   --scroll: #333a44;
-  --shadow: rgba(0, 0, 0, 0.45);
+  --shadow: rgba(0, 0, 0, 0.3);
 
   --gap: 0.625rem;
   --radius: 0.625rem;
@@ -60,7 +60,7 @@
   --badge-bg: #e3e6ea;
   --badge-fg: #24292f;
   --scroll: #c2c7ce;
-  --shadow: rgba(16, 24, 40, 0.14);
+  --shadow: rgba(16, 24, 40, 0.1);
 }
 
 * {
@@ -109,9 +109,10 @@ body {
 
 /* ---------------------------------------------------------------- header */
 
-/* Both bars sit above the discussion and cast a short shadow onto it, so a
-   block scrolling under one reads as passing behind it rather than colliding
-   with it. They have to be stacked to paint over a later sibling. */
+/* Both bars sit above the discussion; each casts a hairline of shadow onto it
+   only while there is something under that edge to pass behind, which is what
+   `data-under-head` and `data-under-foot` say. They have to be stacked to
+   paint over a later sibling. */
 .bar {
   position: relative;
   z-index: 1;
@@ -121,7 +122,11 @@ body {
   padding: 0.5rem 0.75rem;
   border-bottom: 1px solid var(--border);
   background: var(--bg-soft);
-  box-shadow: 0 6px 14px -8px var(--shadow);
+  transition: box-shadow 0.15s ease;
+}
+
+.app[data-under-head="true"] .bar {
+  box-shadow: 0 2px 3px -2px var(--shadow);
 }
 
 /* The mark is the title and the status light at once: connection and activity
@@ -621,13 +626,19 @@ body {
 
 /* -------------------------------------------------------------- composer */
 
+/* The inset is the same on every side, so a button sits as far from the edge
+   of the bar as it does from the top of it. */
 .composer {
   position: relative;
   z-index: 1;
   border-top: 1px solid var(--border);
   background: var(--bg-soft);
-  padding: 0.5rem 0.75rem calc(0.5rem + env(safe-area-inset-bottom));
-  box-shadow: 0 -6px 14px -8px var(--shadow);
+  padding: 0.5rem 0.5rem calc(0.5rem + env(safe-area-inset-bottom));
+  transition: box-shadow 0.15s ease;
+}
+
+.app[data-under-foot="true"] .composer {
+  box-shadow: 0 -2px 3px -2px var(--shadow);
 }
 
 .attachments {
@@ -707,8 +718,10 @@ body {
   flex: 1 1 auto;
   resize: none;
   max-height: var(--input-max);
+  /* One line of text plus this padding is exactly `--control`, so an empty box
+     is the same height as the buttons beside it and the row is even. */
   min-height: var(--control);
-  padding: 0.5rem 0.6rem;
+  padding: 0.4rem 0.6rem;
   border: 1px solid var(--input-border);
   border-radius: var(--radius);
   background: var(--input-bg);
@@ -842,10 +855,16 @@ body {
   }
 
   .discussion,
-  .composer,
   .bar {
     padding-left: 1rem;
     padding-right: 1rem;
+  }
+
+  .composer {
+    padding-left: 0.75rem;
+    padding-right: 0.75rem;
+    padding-top: 0.75rem;
+    padding-bottom: calc(0.75rem + env(safe-area-inset-bottom));
   }
 
   .block {
